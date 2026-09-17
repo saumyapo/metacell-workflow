@@ -1,0 +1,24 @@
+#!/bin/bash
+# Submit step 01 to LSF. Equivalent Slurm header:
+# the only things that matter are wall time, one node, and enough memory to hold
+# every sample's matrix at once (step 01 loads them all before merging).
+#BSUB -J metacell-preprocess
+#BSUB -P acc_yourallocation
+#BSUB -W 24:00
+#BSUB -q premium
+#BSUB -n 4
+#BSUB -R rusage[mem=16000]
+#BSUB -o logs/%J.stdout
+#BSUB -eo logs/%J.stderr
+#BSUB -L /bin/bash
+
+set -euo pipefail
+
+# Option A: conda environment
+ml anaconda3
+conda activate metacell
+python3 scripts/01_preprocess.py
+
+# Option B: container, no conda on the compute node at all. Bind the repo and
+# the data root so paths inside the container match paths outside it.
+# singularity exec --bind "$PWD":"$PWD" --pwd "$PWD" env/metacell.sif python3 scripts/01_preprocess.py
