@@ -1,0 +1,63 @@
+# Single source of truth for every path and every tunable in the workflow.
+# Both the Python steps (01, 02, 04) and the R steps read from here, so a
+# parameter is only ever changed in one place.
+
+project:
+  # short slug used in every output filename
+  name: project
+  # everything below is resolved relative to the repo root unless absolute
+  root: .
+
+paths:
+  # per-sample Cell Ranger filtered_feature_bc_matrix.h5 files
+  gex_h5: data/gex
+  # Cell Ranger V(D)J output tree, globbed for filtered_contig_annotations.csv
+  vdj_root: data/vdj
+  # list of V(D)J run directories under vdj_root
+  vdj_batches: [batch1, batch2, batch3, batch4]
+  # sample sheet and library map
+  samples: config/samples.csv
+  vdj_map: config/vdj_library_map.csv
+  # output trees, created on demand
+  h5ad: results/h5ad
+  rds: results/rds
+  csvs: results/csvs
+  pdfs: results/pdfs
+
+design:
+  # factor levels, in the order they should appear on every axis and in every model
+  condition_levels: [CTRL, CASE]
+  timepoint_levels: [T0, T1, T2, T3, T4]
+  # labels that are not a cell type and are dropped before any composition or DE test
+  drop_labels: [Outlier, Unassigned, Undefined]
+
+preprocess:
+  # a second productive TRB has to clear both of these to count as a doublet
+  min_second_beta_umis: 2
+  min_second_beta_frac: 0.30
+
+metacells_global:
+  target_metacell_size: 72
+  target_metacell_umis: 240000
+  target_metacells_in_pile: 100
+  min_pile: 2000
+  max_pile: 16000
+  min_umi_floor: 500
+  max_excluded_gene_fraction: 0.2
+  random_seed: 123
+
+metacells_subset:
+  # smaller target: a single lineage needs finer grain than the global run
+  target_metacell_size: 24
+  target_metacell_umis: 160000
+  target_metacells_in_pile: 100
+  min_pile: 8000
+  max_pile: 16000
+  random_seed: 123
+  # a metacell joins the subset only if it carries lineage signal and no foreign program
+  purity_min: 0.3
+  purity_other_max: 0.4
+  # blocks scoring within this many z of their second-best call are reviewed by hand
+  margin_thresh: 0.5
+  # prefix on subset metacell names so subset and global IDs can never collide
+  mc_prefix: "S_"
