@@ -1,16 +1,16 @@
 # Metacell Workflow (MC2)
 
-![R](https://img.shields.io/badge/R-4.4-276DC3?style=flat-square&logo=r&logoColor=white)
+![R](https://img.shields.io/badge/R-4.2-276DC3?style=flat-square&logo=r&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.10-3776AB?style=flat-square&logo=python&logoColor=white)
 ![Seurat](https://img.shields.io/badge/Seurat-v5-black?style=flat-square)
 ![MC2](https://img.shields.io/badge/metacells-0.9.5-8B1A1A?style=flat-square)
 [![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 
-End-to-end metacell pipeline for single-cell RNA-seq with paired V(D)J: raw
+Metacell pipeline for single-cell RNA-seq with paired V(D)J: raw
 matrices in, cell type annotations, composition statistics, differential
 expression, pathway enrichment and clonal repertoire out.
 
-## What a metacell is, in one paragraph
+## What a metacell is
 
 A droplet gives a few thousand UMIs from a cell holding a few hundred thousand
 mRNA molecules, so most genes in most cells read zero and a zero is ambiguous.
@@ -21,11 +21,10 @@ were dropout noise at the single-cell level, and still fine grained enough that
 real states are not averaged away.
 
 The pipeline does that twice: once across the whole dataset to get broad
-lineages, then again inside one lineage to resolve states. Composition,
-differential expression, GSEA and clonal repertoire all hang off those two
-annotations.
+lineages, then again inside a subset to resolve sub-states. Composition,
+differential expression, GSEA and clonal repertoire, etc, are all based on these anntations.
 
-New to any of this, start with [docs/01_background.md](docs/01_background.md).
+Metacell Intro: [docs/01_background.md](docs/01_background.md).
 
 ## The pipeline
 
@@ -43,17 +42,17 @@ New to any of this, start with [docs/01_background.md](docs/01_background.md).
    |     and conquer    |          +-----------+----------------+
    +--------------------+                      |  broad_label
                                                v
-   +--------------------+          +----------------------------+
-   | 04  subset         |          | 05  subset annotation      |
-   |     metacells      |--------->|     finer modules, state   |
-   |     purity gate,   |          |     calls                  |
-   |     finer grain    |          +-----------+----------------+
-   +--------------------+                      |  cluster_label
-                                               v
-        +--------------------------------------+-------------------------+
-        v                    v                  v                        v
-  06 stacked bars     08 pseudobulk DE    10 clonal repertoire   12 external labels
-  07 CLR models       09 GSEA             11 clonal statistics
+                                    +--------------------+          +----------------------------+
+                                    | 04  subset         |          | 05  subset annotation      |
+                                    |     metacells      |--------->|     finer modules, state   |
+                                    |     purity gate,   |          |     calls                  |
+                                    |     finer grain    |          +-----------+----------------+
+                                    +--------------------+                      |  cluster_label
+                                                                                v
+                                         +--------------------------------------+-------------------------+
+                                         v                    v                  v                        v
+                                   06 stacked bars     08 pseudobulk DE    10 clonal repertoire   12 external labels
+                                   07 CLR models       09 GSEA             11 clonal statistics
 ```
 
 | Step | File | Lang | What it does |
@@ -79,7 +78,7 @@ top of each file.
 
 ```bash
 git clone https://github.com/saumyapo/metacell-workflow.git && cd metacell-workflow
-mamba env create -f env/metacell.yml && conda activate metacell   # or use the container
+conda env create -f env/metacell.yml && conda activate metacell   # or use the container
 $EDITOR config/samples.csv config/vdj_library_map.csv config/config.yaml
 python3 scripts/01_preprocess.py
 jupyter lab scripts/02_global_metacells.ipynb
