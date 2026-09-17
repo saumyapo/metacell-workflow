@@ -1,0 +1,73 @@
+Bootstrap: docker
+From: rocker/r-ver:4.4.2
+
+# R side of the workflow: steps 03, 05 to 12.
+# Separate image from metacell.sif on purpose. The R stack and the MC2 stack
+# have different, occasionally conflicting, system library needs, and keeping
+# them apart means an R package bump cannot invalidate the Python image.
+#
+# The one place they meet is reticulate in 03 and 05, which reads the .h5ad
+# files. That is handled by binding the Python env into this container rather
+# than by installing conda twice, see the run command below.
+#
+# Build:
+#     apptainer build env/metacell-r.sif env/metacell-r.def
+#
+# Run (with the Python env bound in for reticulate):
+#     apptainer exec \
+#       --bind "$PWD":"$PWD" --bind /path/to/envs/metacell:/opt/pyenv \
+#       --pwd "$PWD" --env RETICULATE_PYTHON=/opt/pyenv/bin/python \
+#       env/metacell-r.sif Rscript -e 'rmarkdown::render("scripts/03_global_modules_annotation.Rmd")'
+
+%post
+    set -eux
+
+    apt-get update && apt-get install -y --no-install-recommends \
+        libcurl4-openssl-dev libssl-dev libxml2-dev libgit2-dev \
+        libhdf5-dev libglpk-dev libgsl-dev libfftw3-dev \
+        libfontconfig1-dev libharfbuzz-dev libfribidi-dev \
+        libfreetype6-dev libpng-dev libtiff5-dev libjpeg-dev \
+        libmagick++-dev pandoc && rm -rf /var/lib/apt/lists/*
+
+    # Posit package manager snapshot: pins every CRAN package to one date
+    # without listing a version for each. Bumping this line is the only way to
+    # move the whole R stack, and the only thing that decides what "newer" means.
+    echo 'options(repos = c(CRAN = "https://packagemanager.posit.co/cran/2025-01-15"))' \
+        >> /usr/local/lib/R/etc/Rprofile.site
+
+    R -e 'install.packages(c("remotes", "BiocManager"))'
+    R -e 'BiocManager::install(version = "3.20", ask = FALSE)'
+
+    # CRAN
+    R -e 'install.packages(c( \
+      "Seurat", "SeuratObject", "tidyverse", "dplyr", "tidyr", "purrr", "forcats", \
+      "ggplot2", "ggrepel", "ggridges", "patchwork", "cowplot", "scales", \
+      "openxlsx", "writexl", "readr", "stringr", "reticulate", "anndata", \
+      "lme4", "lmerTest", "emmeans", "compositions", "circlize", "heatmaply", \
+      "msigdbr", "Matrix", "rmarkdown", "knitr", "here"))'
+
+    # Bioconductor
+    R -e 'BiocManager::install(c( \
+      "DESeq2", "edgeR", "limma", "variancePartition", "BiocParallel", "ashr", \
+      "ComplexHeatmap", "clusterProfiler", "org.Hs.eg.db", "fgsea", \
+      "rtracklayer", "S4Vectors", "scRepertoire"), ask = FALSE, update = FALSE)'
+
+    # GitHub-only
+    R -e 'remotes::install_github("enblacar/SCpubr")'
+
+    # freeze the resolved versions into the image for auditing
+    R -e 'write.csv(as.data.frame(installed.packages()[, c("Package","Version")]), \
+          "/opt/r-packages.csv", row.names = FALSE)'
+
+%environment
+    export R_LIBS_USER=/usr/local/lib/R/site-library
+    export OMP_NUM_THREADS=1
+
+%test
+    R -e 'stopifnot(packageVersion("Seurat") >= "5.0.0", \
+                    packageVersion("scRepertoire") >= "2.0.0"); \
+          cat("ok\n")'
+
+%labels
+    Stage r
+    Steps 03,05-12
