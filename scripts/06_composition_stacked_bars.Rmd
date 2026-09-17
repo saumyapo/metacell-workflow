@@ -1,0 +1,278 @@
+---
+title: "06 Composition: stacked bar plots"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: cosmo
+    code_folding: hide
+---
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(scales)
+library(openxlsx)
+```
+
+# Configuration
+
+```{r, results = FALSE, message=FALSE, warning=FALSE}
+# LEVEL selects which annotated object this notebook runs on. Nothing else in
+# the file is level-specific, so a subset run is a one-word edit here.
+#   "global"  the whole dataset, annotated by broad lineage in 03
+#   "subset"  one lineage, annotated by state in 05
+LEVEL <- "subset"
+
+source(file.path("..", "config", "config.R"))
+
+CFG <- switch(LEVEL,
+  global = list(slug = "global", prefix = "global",      label = "broad_label",
+                title = "All cell types"),
+  subset = list(slug = "subset", prefix = "subset_data", label = "cluster_label",
+                title = "Subset"),
+  stop("LEVEL must be 'global' or 'subset'"))
+
+SUBSET_SLUG  <- CFG$slug
+FILE_PREFIX  <- CFG$prefix
+LABEL_COL    <- CFG$label     # per-cell annotation column written by 03 or 05
+SUBSET_TITLE <- CFG$title     # appears in every figure title
+
+# the annotated Seurat object written at the end of 03 (global) or 05 (subset)
+rds_path <- file.path(DIR_RDS, SUBSET_SLUG, "metacell",
+                      paste0(FILE_PREFIX, "_MC_annotated.RDS"))
+
+# output trees for this step, created on demand
+csv_dir <- out_dirs(SUBSET_SLUG, "csv")
+fig_dir <- out_dirs(SUBSET_SLUG, "pdf")
+```
+
+# Read RDS
+
+The metacell is the annotation device, not the counting unit. Every cell carries the
+label of its metacell's block, and the frequencies below are counted over cells.
+Counting metacells instead would be wrong twice over: MC2 sizes metacells to a target
+cell count so their number is not proportional to abundance, and a metacell can pool
+cells from several samples so it has no single sample of origin.
+
+```{r}
+obj <- readRDS(rds_path)
+stopifnot(LABEL_COL %in% colnames(obj@meta.data))
+
+cat("Cells total:                            ", ncol(obj), "\n")
+print(table(obj@meta.data[[LABEL_COL]], useNA = "ifany"))
+cat("Cells dropped (no cell type call):      ",
+    sum(obj@meta.data[[LABEL_COL]] %in% drop_labels), "\n")
+```
+
+# QC on the dropped cells
+
+Dropping unlabelled cells is only harmless if the drop rate is flat across samples and
+conditions. If one condition loses many more cells than another, every proportion below
+is shifted by that alone, so this table is checked before trusting any of the plots.
+
+```{r}
+drop_qc <- obj@meta.data %>%
+  mutate(dropped = .data[[LABEL_COL]] %in% drop_labels) %>%
+  group_by(sample_origin, condition, timepoint) %>%
+  summarise(n_cells     = n(),
+            n_dropped   = sum(dropped),
+            pct_dropped = 100 * mean(dropped),
+            .groups = "drop") %>%
+  arrange(desc(pct_dropped))
+
+print(as.data.frame(drop_qc))
+
+drop_qc_cond <- drop_qc %>%
+  group_by(condition) %>%
+  summarise(mean_pct_dropped = mean(pct_dropped),
+            min_pct_dropped  = min(pct_dropped),
+            max_pct_dropped  = max(pct_dropped),
+            .groups = "drop")
+print(as.data.frame(drop_qc_cond))
+```
+
+# Per-sample composition table
+
+`complete()` is what makes the donor means honest: a label absent from a sample is a
+real zero for that sample, not a missing row. Without it the mean for a rare label is
+taken over only the donors that happen to carry it, the per-group percentages no longer
+sum to 100, and every stacked bar is silently renormalised.
+
+```{r}
+meta <- obj@meta.data %>%
+  mutate(cell_label = as.character(.data[[LABEL_COL]])) %>%
+  filter(!cell_label %in% drop_labels)
+
+sample_map <- meta %>%
+  select(sample_origin, patient_id, condition, timepoint, category, category_plot) %>%
+  distinct()
+stopifnot(!anyDuplicated(sample_map$sample_origin))
+
+per_sample_counts <- meta %>%
+  dplyr::count(sample_origin, cell_label, name = "n") %>%
+  tidyr::complete(sample_origin, cell_label, fill = list(n = 0)) %>%
+  group_by(sample_origin) %>%
+  mutate(total_cells_sample = sum(n),
+         pct_within_sample  = n / total_cells_sample * 100) %>%
+  ungroup() %>%
+  left_join(sample_map, by = "sample_origin") %>%
+  mutate(timepoint = factor(as.character(timepoint), levels = TP_LEVELS),
+         condition = factor(as.character(condition), levels = COND_LEVELS))
+
+# every sample must close to 100 percent, otherwise the stacked bars are meaningless
+stopifnot(all(abs(
+  tapply(per_sample_counts$pct_within_sample, per_sample_counts$sample_origin, sum) - 100
+) < 1e-8))
+stopifnot(!anyNA(per_sample_counts$condition))
+
+write.xlsx(as.data.frame(per_sample_counts),
+           file.path(csv_dir, paste0(FILE_PREFIX, "_per_sample_composition.xlsx")),
+           rowNames = FALSE)
+```
+
+```{r}
+base_palette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00",
+                  "#CC79A7", "#999999", "#6A3D9A", "#B2182B", "#78A850", "#4D8FAC",
+                  "#A0522D", "#C4A0C8", "#2D6A4F", "#C8A882", "#E07B8A", "#00B4C8",
+                  "#8B1A1A", "#9AB8D4", "#D4A017", "#7B7B3C", "#5C4A72", "#E64B35",
+                  "#8491B4", "#FAD4C0", "#ff7f0e", "#00468B", "#c49c94")
+
+labs_all <- sort(unique(per_sample_counts$cell_label))
+label_cols <- setNames(
+  if (length(labs_all) <= length(base_palette)) base_palette[seq_along(labs_all)]
+  else grDevices::hcl.colors(length(labs_all), "Dark 3"),
+  labs_all)
+stopifnot(!anyNA(names(label_cols)), !anyNA(label_cols))
+```
+
+# Stacked bars
+
+Bars are the mean across donors of each donor's own percentage, so every donor carries
+equal weight regardless of how many cells were captured. Bars are stacked, not filled:
+after `complete()` the means already close to 100, and `position = "fill"` would hide it
+if they ever stopped doing so.
+
+```{r}
+summarise_by <- function(group_col) {
+  per_sample_counts %>%
+    mutate(grp = .data[[group_col]]) %>%
+    group_by(grp, cell_label) %>%
+    summarise(mean_pct = mean(pct_within_sample),
+              sd_pct   = sd(pct_within_sample),
+              sem_pct  = sd(pct_within_sample) / sqrt(n()),
+              n_donors = n(),
+              .groups  = "drop")
+}
+
+stacked_bar <- function(group_col, y_lab, title_str, file_tag) {
+  d <- summarise_by(group_col)
+  # all groups must close to 100, this is the check that complete() did its job
+  stopifnot(all(abs(tapply(d$mean_pct, d$grp, sum) - 100) < 1e-6))
+
+  p <- ggplot(d, aes(x = grp, y = mean_pct, fill = cell_label)) +
+    geom_col(position = "stack", width = 0.75) +
+    scale_fill_manual(values = label_cols) +
+    scale_y_continuous(labels = label_percent(scale = 1), expand = expansion(mult = c(0, 0.02))) +
+    labs(y = y_lab, x = NULL, fill = NULL, title = title_str) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          panel.grid.major.x = element_blank(),
+          plot.title = element_text(size = 10))
+
+  ggsave(file.path(fig_dir, paste0(FILE_PREFIX, "_stacked_", file_tag, ".pdf")),
+         p, width = 8, height = 5)
+  print(p)
+  invisible(d)
+}
+```
+
+## By patient
+
+```{r}
+d_category <- stacked_bar("category",
+  "Mean proportion across that patient's timepoints (%)",
+  paste0(SUBSET_TITLE, ": composition by patient"), "by_patient")
+```
+
+## By condition
+
+```{r}
+d_condition <- stacked_bar("condition",
+  "Mean proportion across that condition's samples (%)",
+  paste0(SUBSET_TITLE, ": composition by condition"), "by_condition")
+```
+
+## By sample
+
+```{r, fig.width = 12}
+d_sample <- stacked_bar("category_plot",
+  "Proportion per sample (%)",
+  paste0(SUBSET_TITLE, ": composition by sample"), "by_sample")
+```
+
+## By timepoint within condition
+
+```{r, fig.width = 10}
+d_cond_tp <- per_sample_counts %>%
+  mutate(cond_tp = factor(paste(condition, timepoint),
+                          levels = paste(rep(COND_LEVELS, each = length(TP_LEVELS)), TP_LEVELS))) %>%
+  filter(!is.na(cond_tp)) %>%
+  group_by(cond_tp, cell_label) %>%
+  summarise(mean_pct = mean(pct_within_sample), n_donors = n(), .groups = "drop") %>%
+  mutate(cond_tp = droplevels(cond_tp))
+stopifnot(all(abs(tapply(d_cond_tp$mean_pct, d_cond_tp$cond_tp, sum) - 100) < 1e-6))
+
+p <- ggplot(d_cond_tp, aes(x = cond_tp, y = mean_pct, fill = cell_label)) +
+  geom_col(position = "stack", width = 0.75) +
+  scale_fill_manual(values = label_cols) +
+  scale_y_continuous(labels = label_percent(scale = 1), expand = expansion(mult = c(0, 0.02))) +
+  labs(y = "Mean proportion across donors (%)", x = NULL, fill = NULL,
+       title = paste0(SUBSET_TITLE, ": composition by condition and timepoint")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.major.x = element_blank(),
+        plot.title = element_text(size = 10))
+ggsave(file.path(fig_dir, paste0(FILE_PREFIX, "_stacked_by_condition_timepoint.pdf")),
+       p, width = 10, height = 5)
+print(p)
+```
+
+# Dodged bars, label by condition
+
+```{r, fig.width = 10}
+d_dodge <- summarise_by("condition")
+
+condition_colours <- c("CTRL" = "#F5C342", "CASE" = "#D4494E")
+
+p <- ggplot(d_dodge, aes(x = cell_label, y = mean_pct, fill = grp)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = mean_pct, ymax = mean_pct + sem_pct),
+                position = position_dodge(width = 0.8), width = 0.25) +
+  scale_fill_manual(values = condition_colours) +
+  scale_y_continuous(labels = label_percent(scale = 1)) +
+  labs(y = "% of a sample's cells (mean across samples, +SEM)", x = NULL, fill = NULL,
+       title = paste0(SUBSET_TITLE, ": abundance by condition")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.major.x = element_blank(),
+        plot.title = element_text(size = 10))
+ggsave(file.path(fig_dir, paste0(FILE_PREFIX, "_dodged_by_condition.pdf")), p,
+       width = 10, height = 5)
+print(p)
+```
+
+```{r}
+wb <- createWorkbook()
+addWorksheet(wb, "by_patient");   writeData(wb, "by_patient",   as.data.frame(d_category))
+addWorksheet(wb, "by_condition"); writeData(wb, "by_condition", as.data.frame(d_condition))
+addWorksheet(wb, "by_sample");    writeData(wb, "by_sample",    as.data.frame(d_sample))
+addWorksheet(wb, "by_cond_tp");   writeData(wb, "by_cond_tp",   as.data.frame(d_cond_tp))
+addWorksheet(wb, "drop_qc");      writeData(wb, "drop_qc",      as.data.frame(drop_qc))
+saveWorkbook(wb, file.path(csv_dir, paste0(FILE_PREFIX, "_composition_summaries.xlsx")),
+             overwrite = TRUE)
+```

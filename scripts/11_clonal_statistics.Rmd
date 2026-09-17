@@ -1,0 +1,1088 @@
+---
+title: "11 Clonal repertoire: diversity, tracking and statistics"
+author: "Saumya Pothukuchi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: cosmo
+    code_folding: hide
+---
+
+<!--
+Reads the RDS written by 10 and does everything that notebook left out:
+rarefied diversity, repertoire tracking across visits, clone sharing between
+states, Startrac, public clones, and the four test families.
+
+Nothing here touches the contig files. chain_status and clone_trb were computed
+upstream and travel on the object.
+
+Metric set: Renyi entropy profiles (Shannon is the single point at alpha = 1),
+rarefaction curves observed and extrapolated, Gini, Tversky asymmetric sharing
+between states, and clone-count biplots between paired visits. Why each one and
+what it is sensitive to: docs/12_clonal.md.
+
+Clones are never pooled across patients. Patient stays the unit throughout.
+
+Writes one workbook. The run manifest is the only place a skipped analysis is
+distinguishable from an empty one.
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+options(width = 60)
+```
+
+```{r libs, results = FALSE}
+library(dplyr)
+library(tidyr)
+library(Seurat)
+library(scRepertoire)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(lme4)
+library(lmerTest)
+library(openxlsx)
+```
+
+R: `r R.Version()$version.string`,
+Seurat: `r packageVersion('Seurat')`,
+scRepertoire: `r packageVersion('scRepertoire')`,
+lme4: `r packageVersion('lme4')`,
+lmerTest: `r packageVersion('lmerTest')`
+
+# What the replicate is
+
+Every metric is first reduced to one number per sample, then tested with patient
+as the unit, with patient as a random intercept for anything that spans
+timepoints. Repertoire metrics depend strongly
+on how many cells were sequenced, so diversity is computed on repeated
+rarefactions to a common depth rather than on raw counts, and samples below
+`MIN_VDJ_CELLS` are dropped rather than reported.
+
+With small arms the smallest attainable Wilcoxon p is bounded by the group sizes
+alone, and only under perfect separation. The condition family is therefore
+reported with effect sizes and an explicit `powered` flag rather than as a test
+that can succeed.
+
+Every figure axis is labelled with `category_plot`.
+`sample_origin` stays in every table as the join key, never as a figure axis.
+
+# Configuration
+
+```{r config, results = FALSE}
+# Same config as 10, so the two notebooks cannot disagree about levels or paths.
+source(file.path("..", "config", "config.R"))
+
+SUBSET_SLUG  <- "subset"
+FILE_PREFIX  <- "subset_data"
+SUBSET_TITLE <- "Subset"
+
+# the object 10 wrote, with the repertoire already attached
+rds_path   <- file.path(DIR_RDS, SUBSET_SLUG, "metacell",
+                        paste0(FILE_PREFIX, "_MC_TCR.RDS"))
+clone_root <- file.path(out_dirs(SUBSET_SLUG, "csv"), "clonal")
+fig_dir    <- file.path(out_dirs(SUBSET_SLUG, "pdf"), "clonal")
+for (d in c(clone_root, fig_dir)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+# Diversity is depth-dependent, so samples are rarefied to a common cell count
+# before any index is computed. Both numbers are judgement calls: raising
+# MIN_VDJ_CELLS keeps the estimates tighter but drops samples, and RAREFY_TO
+# should sit at or below the smallest retained sample.
+MIN_VDJ_CELLS       <- 750   # a sample below this cannot support a diversity estimate
+RAREFY_TO           <- 600   # NA means the smallest retained sample
+MIN_CELLS_UNIT      <- 20    # per state, per sample, for the state-wise tables
+MIN_UNITS_PER_GROUP <- 2
+N_BOOTS             <- 100
+DROPOUT_FLAG_PCT    <- 10    # warn if a sample exceeds this % alpha-less cells
+RENYI_ALPHA <- c(0, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, Inf)
+set.seed(123)
+
+MANIFEST <- list()
+
+log_row <- function(family, unit, item, n_test, n_ref, n_units, status, note = NA_character_)
+  MANIFEST[[length(MANIFEST) + 1]] <<- data.frame(
+    family = family, unit = unit, item = item, n_test = n_test, n_ref = n_ref,
+    n_units = n_units, status = status, note = note, stringsAsFactors = FALSE)
+
+safe <- function(expr, family, unit, item) {
+  tryCatch(expr, error = function(e) {
+    log_row(family, unit, item, NA_integer_, NA_integer_, NA_integer_, "skipped",
+            substr(conditionMessage(e), 1, 200))
+    NULL
+  })
+}
+```
+
+## Palette and theme
+
+Identical to the main notebook, so the two sets of figures read as one set.
+Clone-size ramp from Mhanna et al., Cell Rep Methods 2024, Fig 1C.
+
+```{r palette, results = FALSE}
+PAL_COND   <- c(CTRL = "#4C7FB8", CASE = "#A02C2C")
+PAL_CLONAL <- c(Unique = "#4FBF6E", Expanded = "#3F4E8C")
+PAL_SEQ    <- c("#BBD7EA", "#7FB2D4", "#3D7FB0", "#FBD277", "#EE8B3C", "#B62B2B")
+PAL_CAT    <- c("#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3", "#937860",
+                "#DA8BC3", "#8C8C8C", "#CCB974", "#64B5CD", "#4A6FE3", "#A0522D")
+
+cat_pal <- function(x) {
+  lv <- if (is.factor(x)) levels(droplevels(x)) else sort(unique(x[!is.na(x)]))
+  setNames(rep(PAL_CAT, length.out = length(lv)), lv)
+}
+
+theme_tcr <- function(base_size = 11) {
+  theme_bw(base_size) +
+    theme(panel.grid.minor   = element_blank(),
+          panel.grid.major.x = element_blank(),
+          panel.border       = element_rect(colour = "grey35", linewidth = 0.5),
+          strip.background   = element_rect(fill = "grey92", colour = "grey35"),
+          strip.text         = element_text(face = "bold", size = rel(0.85)),
+          axis.text.x        = element_text(angle = 45, hjust = 1, vjust = 1),
+          legend.key.size    = unit(0.4, "cm"),
+          plot.title         = element_text(face = "bold", size = rel(1.0)),
+          plot.subtitle      = element_text(colour = "grey30", size = rel(0.85)))
+}
+facet_cond <- function(...) facet_grid(..., scales = "free_x", space = "free_x")
+```
+
+# Load the TCR object
+
+```{r load}
+obj <- readRDS(rds_path)
+
+need <- c("CTstrict", "CTaa", "clone_trb", "chain_status", "has_vdj", "cell_label",
+          "clonalFrequency", "patient_clone_prop", "batch", "category_plot",
+          "clonal_status")
+stopifnot(all(need %in% colnames(obj@meta.data)))
+Idents(obj) <- factor(obj$cell_label)
+
+cat("Cells in object:", ncol(obj), "| with a TCR:", sum(obj$has_vdj),
+    sprintf("(%.1f%%)\n", 100 * mean(obj$has_vdj)))
+
+sample_meta <- obj@meta.data %>%
+  distinct(sample_origin, category_plot, category, patient_id, condition, timepoint, batch) %>%
+  arrange(category_plot)
+stopifnot(!anyDuplicated(sample_meta$sample_origin))
+CAT_LEVELS <- levels(droplevels(factor(sample_meta$category)))
+
+patient_meta <- sample_meta %>% distinct(patient_id, category, condition)
+stopifnot(!anyDuplicated(patient_meta$patient_id))
+
+# a patient with one sequenced visit gives a structural 0% persistence and a
+# "patient average" that is really a single sample. Flagged so it travels with
+# every table.
+patient_visits <- sample_meta %>%
+  dplyr::count(patient_id, category, condition, name = "n_visits_seq") %>%
+  mutate(single_visit = n_visits_seq < 2)
+print(as.data.frame(patient_visits))
+
+cat_of <- setNames(as.character(sample_meta$category_plot), sample_meta$sample_origin)
+
+# drop_labels applied once, here. md_v is the analysis frame for everything below.
+md   <- obj@meta.data
+md_v <- md %>% filter(has_vdj, !cell_label %in% drop_labels)
+md_v$cell_label <- factor(md_v$cell_label, levels = sort(unique(md_v$cell_label)))
+PAL_STATE <- cat_pal(md_v$cell_label)
+cat("Cells entering the analysis frame:", nrow(md_v), "\n")
+```
+
+# Helpers
+
+Chao1 is not computed. On singleton-dominated TCR data it ran from 637 to 60,000
+after rarefaction, and because it sat in the same BH family it inflated the
+adjusted p-values of every other metric.
+
+```{r helpers, results = FALSE}
+# Gini inequality on the clone size vector. Nat Med 2023 use this as their
+# clonality index. 0 = every clone the same size, 1 = one clone holds everything.
+gini <- function(x) {
+  x <- sort(x[!is.na(x)]); n <- length(x)
+  if (n < 2 || sum(x) == 0) return(NA_real_)
+  sum((2 * seq_len(n) - n - 1) * x) / (n * sum(x))
+}
+
+# Renyi entropy of order alpha. alpha = 0 -> log(richness), alpha -> 1 ->
+# Shannon, alpha = 2 -> log(inverse Simpson), alpha -> Inf -> -log(max p).
+renyi <- function(p, alpha) {
+  p <- p[p > 0]
+  if (is.infinite(alpha)) return(-log(max(p)))
+  if (abs(alpha - 1) < 1e-9) return(-sum(p * log(p)))
+  log(sum(p^alpha)) / (1 - alpha)
+}
+
+div_metrics <- function(clones) {
+  clones <- clones[!is.na(clones)]
+  tab <- table(clones)
+  p   <- as.numeric(tab) / sum(tab)
+  n   <- sum(tab)
+  data.frame(
+    n_cells      = n,
+    n_clones     = length(tab),
+    shannon      = -sum(p * log(p)),
+    eff_clones   = exp(-sum(p * log(p))),   # e^shannon, the readable version
+    norm_entropy = if (length(tab) > 1) -sum(p * log(p)) / log(length(tab)) else NA_real_,
+    inv_simpson  = 1 / sum(p^2),
+    gini_simpson = 1 - sum(p^2),
+    gini         = gini(as.numeric(tab)),
+    clonality    = if (length(tab) > 1) 1 + sum(p * log(p)) / log(length(tab)) else NA_real_,
+    pct_expanded = 100 * sum(tab[tab > 1]) / n,
+    top10_pct    = 100 * sum(sort(as.numeric(tab), decreasing = TRUE)[seq_len(min(10, length(tab)))]) / n,
+    stringsAsFactors = FALSE)
+}
+
+div_rarefied <- function(clones, depth, n_boots = N_BOOTS) {
+  clones <- clones[!is.na(clones)]
+  if (length(clones) < depth) return(NULL)
+  reps <- bind_rows(lapply(seq_len(n_boots), function(i)
+    div_metrics(sample(clones, depth, replace = FALSE))))
+  as.data.frame(lapply(reps, function(v) mean(v, na.rm = TRUE)))
+}
+
+# Renyi profile on repeated rarefactions, so the curve is comparable across
+# samples of different depth
+renyi_rarefied <- function(clones, depth, alphas = RENYI_ALPHA, n_boots = N_BOOTS) {
+  clones <- clones[!is.na(clones)]
+  if (length(clones) < depth) return(NULL)
+  m <- vapply(seq_len(n_boots), function(i) {
+    tab <- table(sample(clones, depth, replace = FALSE))
+    p   <- as.numeric(tab) / sum(tab)
+    vapply(alphas, function(a) renyi(p, a), numeric(1))
+  }, numeric(length(alphas)))
+  data.frame(alpha = alphas, renyi = rowMeans(m),
+             renyi_sd = apply(m, 1, stats::sd), stringsAsFactors = FALSE)
+}
+
+# rank-biserial correlation, a rank effect size needing no distributional assumption
+rb_effect <- function(x, y) {
+  if (!length(x) || !length(y)) return(NA_real_)
+  u <- sum(outer(x, y, ">")) + 0.5 * sum(outer(x, y, "=="))
+  2 * u / (length(x) * length(y)) - 1
+}
+
+morisita <- function(a, b) {
+  a <- a[!is.na(a)]; b <- b[!is.na(b)]
+  ta <- table(a); tb <- table(b)
+  u  <- union(names(ta), names(tb))
+  x  <- as.numeric(ta[u]); x[is.na(x)] <- 0
+  y  <- as.numeric(tb[u]); y[is.na(y)] <- 0
+  X  <- sum(x); Y <- sum(y)
+  if (X < 2 || Y < 2) return(NA_real_)
+  la <- sum(x * (x - 1)) / (X * (X - 1))
+  lb <- sum(y * (y - 1)) / (Y * (Y - 1))
+  if ((la + lb) == 0) return(NA_real_)
+  2 * sum(x * y) / ((la + lb) * X * Y)
+}
+
+# Tversky asymmetric similarity, a = 1 and b = 0, i.e. the fraction of A's
+# clones that also appear in B. Asymmetric on purpose: a small state can be
+# almost contained in a large one without the reverse holding.
+tversky <- function(A, B, a = 1, b = 0) {
+  A <- unique(A[!is.na(A)]); B <- unique(B[!is.na(B)])
+  if (!length(A) || !length(B)) return(NA_real_)
+  i <- length(intersect(A, B))
+  i / (i + a * length(setdiff(A, B)) + b * length(setdiff(B, A)))
+}
+```
+
+# Rarefaction curves
+
+Observed clonotype richness as a function of how many cells are drawn. Two
+samples are only comparable where their curves overlap, which is the whole
+argument for rarefying rather than reporting richness as sequenced. The vertical
+line is `RAREFY_TO`; every sample used in the models has a curve that reaches it.
+
+```{r rarefaction, fig.width = 10, fig.height = 5}
+rare_curve <- bind_rows(lapply(split(md_v, md_v$sample_origin), function(d) {
+  cl <- d$CTstrict[!is.na(d$CTstrict)]
+  if (!length(cl)) return(NULL)
+  depths <- unique(pmin(c(seq(50, length(cl), by = 100), length(cl)), length(cl)))
+  bind_rows(lapply(depths, function(k) {
+    r <- mean(replicate(20, length(unique(sample(cl, k, replace = FALSE)))))
+    data.frame(sample_origin = d$sample_origin[1], depth = k, richness = r)
+  }))
+})) %>% left_join(sample_meta, by = "sample_origin")
+
+p_rarecurve <- ggplot(rare_curve, aes(depth, richness,
+                                      group = category_plot, colour = condition)) +
+  geom_line(alpha = 0.8, linewidth = 0.5) +
+  geom_vline(xintercept = RAREFY_TO, linetype = "dashed", colour = "grey40") +
+  facet_grid(~ condition) +
+  scale_colour_manual(values = PAL_COND, guide = "none") +
+  labs(x = "Cells sampled", y = "Unique clonotypes observed",
+       title = paste0(SUBSET_TITLE, ": rarefaction curves"),
+       subtitle = sprintf("One line per sample. Dashed line is the rarefaction depth (%d cells).",
+                          RAREFY_TO)) +
+  theme_tcr() + theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+p_rarecurve
+```
+
+# Per sample repertoire metrics
+
+Clones are counted among the cells of this subset only, so the denominator is T
+cells that carried a recoverable TCR. Raw and rarefied are both written: raw
+describes the sample as sequenced, rarefied is what the models are fitted on.
+`trb_*` repeats the rarefied metrics on the beta-only clone id, which is the
+sensitivity check against alpha-chain dropout.
+
+```{r sample-metrics}
+raw_metrics <- bind_rows(lapply(split(md_v$CTstrict, md_v$sample_origin), div_metrics),
+                         .id = "sample_origin")
+
+usable <- raw_metrics$sample_origin[raw_metrics$n_cells >= MIN_VDJ_CELLS]
+depth  <- if (is.na(RAREFY_TO))
+  min(raw_metrics$n_cells[raw_metrics$sample_origin %in% usable]) else RAREFY_TO
+# RAREFY_TO used to equal MIN_VDJ_CELLS, so a threshold sample carried zero
+# subsampling variance while a 5,000-cell sample got a real subsample.
+stopifnot(depth <= MIN_VDJ_CELLS)
+cat("Samples usable:", length(usable), "of", nrow(raw_metrics),
+    "| rarefaction depth:", depth, "cells\n")
+if (length(setdiff(raw_metrics$sample_origin, usable)))
+  cat("Dropped below MIN_VDJ_CELLS:",
+      paste(cat_of[setdiff(raw_metrics$sample_origin, usable)], collapse = ", "), "\n")
+
+rare_metrics <- bind_rows(lapply(usable, function(s) {
+  d <- div_rarefied(md_v$CTstrict[md_v$sample_origin == s], depth)
+  if (is.null(d)) NULL else cbind(sample_origin = s, d)
+}))
+rare_trb <- bind_rows(lapply(usable, function(s) {
+  d <- div_rarefied(md_v$clone_trb[md_v$sample_origin == s], depth)
+  if (is.null(d)) NULL else cbind(sample_origin = s, d)
+}))
+
+# recovery and dropout recomputed from the object, so this notebook needs no contigs
+recovery <- md %>%
+  group_by(sample_origin) %>%
+  summarise(n_cells_subset = n(),
+            vdj_recovery_pct = round(100 * mean(has_vdj), 2), .groups = "drop")
+dropout <- md %>% filter(has_vdj) %>%
+  group_by(sample_origin) %>%
+  summarise(pct_paired    = round(100 * mean(chain_status == "paired"), 2),
+            pct_beta_only = round(100 * mean(chain_status == "beta_only"), 2),
+            .groups = "drop") %>%
+  mutate(dropout_flag = pct_beta_only > DROPOUT_FLAG_PCT)
+
+sample_metrics <- raw_metrics %>%
+  rename_with(~ paste0("raw_", .x), -sample_origin) %>%
+  left_join(rare_metrics %>% rename_with(~ paste0("rare_", .x), -sample_origin),
+            by = "sample_origin") %>%
+  left_join(rare_trb %>% rename_with(~ paste0("trb_", .x), -sample_origin),
+            by = "sample_origin") %>%
+  left_join(recovery, by = "sample_origin") %>%
+  left_join(dropout,  by = "sample_origin") %>%
+  left_join(sample_meta, by = "sample_origin") %>%
+  left_join(patient_visits %>% dplyr::select(patient_id, n_visits_seq, single_visit),
+            by = "patient_id") %>%
+  mutate(usable = sample_origin %in% usable) %>%
+  dplyr::select(category_plot, sample_origin, category, patient_id, condition, timepoint,
+                everything()) %>%
+  arrange(category_plot)
+
+print(as.data.frame(sample_metrics %>%
+  dplyr::select(category_plot, raw_n_cells, raw_n_clones, raw_pct_expanded,
+                rare_shannon, rare_clonality, rare_gini, trb_clonality, usable)))
+
+sens <- sample_metrics %>% filter(usable, is.finite(rare_clonality), is.finite(trb_clonality))
+cat(sprintf("Spearman rho, CTstrict vs beta-only clonality: %.3f (n = %d samples)\n",
+            suppressWarnings(cor(sens$rare_clonality, sens$trb_clonality, method = "spearman")),
+            nrow(sens)))
+```
+
+# Renyi entropy profiles
+
+Shannon is the single point at `alpha = 1`. The profile says which part of the
+distribution any difference lives in: `alpha = 0` is log richness and is driven
+by singletons, `alpha = 1` weights clones by their frequency, and large `alpha`
+is dominated by the single biggest clone. Two repertoires whose curves cross are
+not orderable by any single diversity index, which is worth knowing before
+reporting one.
+
+Computed on the same rarefactions as everything else, so the curves are
+comparable across samples of different depth.
+
+```{r renyi, fig.width = 11, fig.height = 5}
+renyi_tbl <- bind_rows(lapply(usable, function(s) {
+  d <- renyi_rarefied(md_v$CTstrict[md_v$sample_origin == s], depth)
+  if (is.null(d)) NULL else cbind(sample_origin = s, d)
+})) %>% left_join(sample_meta, by = "sample_origin")
+
+# a finite stand-in for Inf so the alpha axis can be drawn
+alpha_levels <- c(as.character(RENYI_ALPHA[is.finite(RENYI_ALPHA)]), "Inf")
+renyi_tbl <- renyi_tbl %>%
+  mutate(alpha_lab = factor(ifelse(is.infinite(alpha), "Inf", as.character(alpha)),
+                            levels = alpha_levels))
+
+p_renyi <- ggplot(renyi_tbl, aes(alpha_lab, renyi, group = category_plot,
+                                 colour = condition)) +
+  geom_line(alpha = 0.8, linewidth = 0.5) + geom_point(size = 1) +
+  facet_grid(~ condition) +
+  geom_vline(xintercept = which(alpha_levels == "1"),
+             linetype = "dashed", colour = "grey40") +
+  scale_colour_manual(values = PAL_COND, guide = "none") +
+  labs(x = expression(alpha), y = "Renyi entropy",
+       title = paste0(SUBSET_TITLE, ": Renyi entropy profiles"),
+       subtitle = "One line per sample, rarefied. Dashed line at alpha = 1 is Shannon entropy.") +
+  theme_tcr() + theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+p_renyi
+```
+
+```{r renyi-tests}
+# a Wilcoxon at each alpha, reported the same way as every other condition test
+renyi_tests <- bind_rows(lapply(RENYI_ALPHA, function(a) {
+  d <- renyi_tbl %>% filter(alpha == a) %>%
+    group_by(category, patient_id, condition) %>%
+    summarise(value = mean(renyi, na.rm = TRUE), .groups = "drop")
+  x <- d$value[d$condition == "CASE"];   x <- x[is.finite(x)]
+  y <- d$value[d$condition == "CTRL"]; y <- y[is.finite(y)]
+  if (min(length(x), length(y)) < MIN_UNITS_PER_GROUP) {
+    log_row("renyi", "patient", paste0("alpha_", a), length(x), length(y),
+            NA_integer_, "skipped")
+    return(NULL)
+  }
+  w     <- suppressWarnings(wilcox.test(x, y))
+  min_p <- min(2 / choose(length(x) + length(y), min(length(x), length(y))), 1)
+  log_row("renyi", "patient", paste0("alpha_", a), length(x), length(y),
+          length(x) + length(y), if (min(length(x), length(y)) < 3) "exploratory" else "ok")
+  data.frame(alpha = a, n_CASE = length(x), n_CTRL = length(y),
+             mean_CASE = mean(x), mean_CTRL = mean(y), diff = mean(x) - mean(y),
+             rank_biserial = rb_effect(x, y), p_val = w$p.value,
+             min_possible_p = min_p, powered = min_p <= 0.05)
+}))
+if (!is.null(renyi_tests) && nrow(renyi_tests)) {
+  renyi_tests$p_val_adj <- p.adjust(renyi_tests$p_val, method = "BH")
+  print(as.data.frame(renyi_tests))
+}
+```
+
+# Per state repertoire metrics
+
+```{r state-metrics}
+state_metrics <- md_v %>%
+  group_by(sample_origin, cell_label) %>%
+  filter(n() >= MIN_CELLS_UNIT) %>%
+  group_modify(~ div_metrics(.x$CTstrict)) %>%
+  ungroup() %>%
+  left_join(sample_meta, by = "sample_origin") %>%
+  dplyr::select(category_plot, sample_origin, cell_label, condition, timepoint, everything()) %>%
+  arrange(category_plot, cell_label)
+```
+
+```{r fig-gini, fig.width = 9, fig.height = 5}
+# Nat Med 2023 Fig 3f: Gini as the headline clonality number, box + points,
+# split by group. Ours keeps the sample as the point and the arm as the box.
+gini_plot <- sample_metrics %>% filter(usable, is.finite(rare_gini))
+p_gini <- ggplot(gini_plot, aes(condition, rare_gini, colour = condition)) +
+  geom_boxplot(aes(fill = condition), alpha = 0.15, outlier.shape = NA,
+               linewidth = 0.5, show.legend = FALSE) +
+  geom_point(position = position_jitter(width = 0.12), size = 2, alpha = 0.85) +
+  facet_grid(~ timepoint) +
+  scale_colour_manual(values = PAL_COND, guide = "none") +
+  scale_fill_manual(values = PAL_COND, guide = "none") +
+  labs(x = NULL, y = "Gini index (rarefied)",
+       title = paste0(SUBSET_TITLE, ": clonal inequality"),
+       subtitle = "One point per sample. 0 = all clones equal, 1 = one clone holds everything.") +
+  theme_tcr()
+p_gini
+```
+
+# Tracking clones across timepoints within a patient
+
+Overlap is computed inside a patient only. Morisita is the one to report: it is
+abundance weighted, where Jaccard is dominated by singletons and can read 0.99
+for two samples that share none of their dominant clones. A clone is persistent
+when it is seen at two or more visits of the same patient.
+
+```{r overlap}
+overlap_tp <- bind_rows(lapply(unique(md_v$patient_id), function(pt) {
+  d   <- md_v[md_v$patient_id == pt, ]
+  tps <- intersect(TP_LEVELS, unique(as.character(d$timepoint)))
+  if (length(tps) < 2) return(NULL)
+  cmb <- t(combn(tps, 2))
+  bind_rows(lapply(seq_len(nrow(cmb)), function(k) {
+    a  <- d$CTstrict[d$timepoint == cmb[k, 1]]
+    b  <- d$CTstrict[d$timepoint == cmb[k, 2]]
+    at <- d$clone_trb[d$timepoint == cmb[k, 1]]
+    bt <- d$clone_trb[d$timepoint == cmb[k, 2]]
+    if (length(a) < MIN_CELLS_UNIT || length(b) < MIN_CELLS_UNIT) return(NULL)
+    sa <- unique(a); sb <- unique(b)
+    data.frame(category   = as.character(d$category[1]), patient_id = pt,
+               condition  = as.character(d$condition[1]),
+               tp_1 = cmb[k, 1], tp_2 = cmb[k, 2],
+               n_cells_1 = length(a), n_cells_2 = length(b),
+               n_clones_1 = length(sa), n_clones_2 = length(sb),
+               n_shared = length(intersect(sa, sb)),
+               jaccard  = length(intersect(sa, sb)) / length(union(sa, sb)),
+               morisita = morisita(a, b),
+               morisita_trb = morisita(at, bt),
+               stringsAsFactors = FALSE)
+  }))
+})) %>% arrange(category, tp_1, tp_2)
+print(as.data.frame(overlap_tp %>% dplyr::select(-patient_id, -morisita_trb)))
+```
+
+## Clone-count biplots between consecutive visits
+
+Cell Rep Methods Fig 2C. Every clone of a patient plotted at its size in the
+first visit against its size in the second. Shared clones sit on the diagonal,
+clones private to one visit lie along an axis. It answers, per clone, what
+Morisita answers as one number, and it shows whether an overlap value is carried
+by a few large clones or by a long tail of singletons.
+
+Sizes are on a log axis with a half-cell offset so absent clones can be drawn.
+
+```{r fig-biplot, fig.width = 12, fig.height = 7}
+consec <- overlap_tp %>%
+  group_by(patient_id) %>%
+  filter(match(tp_2, TP_LEVELS) == match(tp_1, TP_LEVELS) + 1 |
+           row_number() == 1) %>%   # consecutive pairs, or the only pair
+  ungroup()
+
+biplot_dat <- bind_rows(lapply(seq_len(nrow(consec)), function(k) {
+  r <- consec[k, ]
+  d <- md_v %>% filter(patient_id == r$patient_id,
+                       timepoint %in% c(r$tp_1, r$tp_2))
+  w <- d %>% dplyr::count(CTstrict, timepoint, name = "n") %>%
+    tidyr::pivot_wider(names_from = timepoint, values_from = n, values_fill = 0)
+  if (!all(c(r$tp_1, r$tp_2) %in% names(w))) return(NULL)
+  data.frame(category = r$category, condition = r$condition,
+             pair = paste(r$tp_1, r$tp_2, sep = " -> "),
+             x = w[[r$tp_1]], y = w[[r$tp_2]],
+             stringsAsFactors = FALSE)
+})) %>%
+  mutate(status = ifelse(x > 0 & y > 0, "shared",
+                  ifelse(x > 0, "first visit only", "second visit only")),
+         mean_n = (x + y) / 2)
+
+p_biplot <- ggplot(biplot_dat, aes(x + 0.5, y + 0.5, colour = log2(mean_n + 1))) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey70", linetype = "dashed") +
+  geom_point(alpha = 0.6, size = 1.2) +
+  facet_wrap(category ~ pair, scales = "free") +
+  scale_x_log10() + scale_y_log10() +
+  scale_colour_gradientn(colours = PAL_SEQ) +
+  labs(x = "Clone size, earlier visit", y = "Clone size, later visit",
+       colour = "log2(mean count)",
+       title = paste0(SUBSET_TITLE, ": clone sizes between consecutive visits"),
+       subtitle = "Shared clones lie on the diagonal, private clones along the axes. 0.5 added to allow the log axis.") +
+  theme_tcr() + theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+                      strip.text = element_text(size = rel(0.7)))
+p_biplot
+```
+
+```{r persistence}
+persist <- md_v %>%
+  distinct(patient_id, condition, CTstrict, timepoint) %>%
+  dplyr::count(patient_id, condition, CTstrict, name = "n_visits")
+
+persist_summary <- persist %>%
+  group_by(patient_id, condition) %>%
+  summarise(n_clones = n(), n_persistent = sum(n_visits >= 2),
+            pct_persistent = round(100 * mean(n_visits >= 2), 2),
+            max_visits = max(n_visits), .groups = "drop") %>%
+  left_join(patient_visits, by = c("patient_id", "condition")) %>%
+  mutate(pct_persistent = ifelse(single_visit, NA_real_, pct_persistent)) %>%
+  dplyr::select(category, patient_id, condition, everything()) %>%
+  arrange(category)
+print(as.data.frame(persist_summary %>% dplyr::select(-patient_id)))
+
+persistent_clones <- md_v %>%
+  inner_join(persist %>% filter(n_visits >= 2) %>% dplyr::select(patient_id, CTstrict),
+             by = c("patient_id", "CTstrict")) %>%
+  group_by(category, patient_id, condition, CTstrict) %>%
+  summarise(n_cells = n(),
+            pct_of_patient = round(100 * dplyr::first(patient_clone_prop), 3),
+            visits = paste(sort(unique(as.character(timepoint))), collapse = ","),
+            states = paste(sort(unique(as.character(cell_label))), collapse = ","),
+            CTaa   = names(sort(table(CTaa), decreasing = TRUE))[1],
+            .groups = "drop") %>%
+  arrange(category, desc(n_cells))
+```
+
+```{r tracking-plots, fig.width = 10, fig.height = 6}
+if (nrow(overlap_tp)) {
+  p_overlap <- ggplot(overlap_tp, aes(paste(tp_1, tp_2, sep = " vs "), morisita,
+                                      colour = condition)) +
+    geom_point(position = position_jitter(width = 0.12), size = 2) +
+    ggrepel::geom_text_repel(aes(label = category), size = 2.5, max.overlaps = 20,
+                             show.legend = FALSE) +
+    facet_grid(~ condition) +
+    scale_colour_manual(values = PAL_COND, guide = "none") +
+    labs(x = NULL, y = "Morisita overlap",
+         title = paste0(SUBSET_TITLE, ": repertoire overlap between visits, within patient")) +
+    theme_tcr()
+  print(p_overlap)
+} else p_overlap <- NULL
+
+# top clone trajectories per patient, the clearest single view of expansion and contraction
+traj <- md_v %>%
+  dplyr::count(category, patient_id, condition, timepoint, CTstrict, name = "n") %>%
+  group_by(patient_id, timepoint) %>% mutate(prop = n / sum(n)) %>%
+  group_by(patient_id, CTstrict) %>% mutate(peak = max(prop)) %>% ungroup()
+top_clones <- traj %>% distinct(patient_id, CTstrict, peak) %>%
+  group_by(patient_id) %>% slice_max(peak, n = 10, with_ties = FALSE) %>% ungroup()
+traj_top <- traj %>% semi_join(top_clones, by = c("patient_id", "CTstrict"))
+p_traj <- if (nrow(traj_top))
+  ggplot(traj_top, aes(timepoint, 100 * prop, group = CTstrict, colour = CTstrict)) +
+    geom_line(alpha = 0.7) + geom_point(size = 1) +
+    facet_wrap(~ category, scales = "free_y") +
+    labs(x = NULL, y = "% of TCR+ cells at that visit",
+         title = paste0(SUBSET_TITLE, ": top 10 clones per patient")) +
+    theme_tcr() + theme(legend.position = "none",
+                        axis.text.x = element_text(angle = 0, hjust = 0.5)) else NULL
+if (!is.null(p_traj)) print(p_traj)
+```
+
+# Clones shared between states
+
+A clone found in two states is one lineage occupying both, which is the
+differentiation question rather than the expansion question. Sharing is counted
+inside a patient and then averaged over patients.
+
+Two indices are written. `overlap_coef` (shared / smaller set) is symmetric and
+is what the previous version plotted. `tversky` is the asymmetric containment
+used in Nat Med 2023 Fig 3c: the value in row *i*, column *j* is the fraction of
+state *i*'s clones that also appear in state *j*. Asymmetry is the point. A small
+effector state can be almost entirely contained within a large memory state
+while the reverse is nearly zero, and a symmetric index averages that away.
+
+```{r state-sharing}
+state_sharing <- bind_rows(lapply(unique(md_v$patient_id), function(pt) {
+  d  <- md_v[md_v$patient_id == pt, ]
+  st <- sort(unique(as.character(d$cell_label)))
+  st <- st[vapply(st, function(s) sum(d$cell_label == s) >= MIN_CELLS_UNIT, logical(1))]
+  if (length(st) < 2) return(NULL)
+  # all ordered pairs, because tversky is not symmetric
+  grd <- expand.grid(state_1 = st, state_2 = st, stringsAsFactors = FALSE) %>%
+    filter(state_1 != state_2)
+  bind_rows(lapply(seq_len(nrow(grd)), function(k) {
+    a <- unique(d$CTstrict[d$cell_label == grd$state_1[k]])
+    b <- unique(d$CTstrict[d$cell_label == grd$state_2[k]])
+    data.frame(category = as.character(d$category[1]), patient_id = pt,
+               condition = as.character(d$condition[1]),
+               state_1 = grd$state_1[k], state_2 = grd$state_2[k],
+               n_clones_1 = length(a), n_clones_2 = length(b),
+               n_shared = length(intersect(a, b)),
+               overlap_coef = length(intersect(a, b)) / min(length(a), length(b)),
+               tversky = tversky(a, b),
+               stringsAsFactors = FALSE)
+  }))
+})) %>% arrange(category, state_1, state_2)
+
+state_sharing_mean <- state_sharing %>%
+  group_by(condition, state_1, state_2) %>%
+  summarise(n_patients = n(),
+            mean_overlap = round(mean(overlap_coef, na.rm = TRUE), 3),
+            mean_tversky = round(mean(tversky, na.rm = TRUE), 3), .groups = "drop")
+```
+
+```{r fig-tversky, fig.width = 11, fig.height = 5.5}
+# Column order from clustering the mean Tversky matrix, so related states sit
+# together instead of alphabetically. Diagonal masked, as in Nat Med 2023.
+sq <- state_sharing_mean %>%
+  group_by(state_1, state_2) %>%
+  summarise(v = mean(mean_tversky, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = state_2, values_from = v) %>%
+  as.data.frame()
+rownames(sq) <- sq$state_1; sq$state_1 <- NULL
+sq <- as.matrix(sq[, rownames(sq), drop = FALSE])
+sq[is.na(sq)] <- 0
+ord <- if (nrow(sq) > 2)
+  rownames(sq)[stats::hclust(stats::dist(sq), method = "ward.D2")$order] else rownames(sq)
+
+tv <- state_sharing_mean %>%
+  mutate(state_1 = factor(state_1, levels = ord),
+         state_2 = factor(state_2, levels = ord))
+
+p_tversky <- ggplot(tv, aes(state_2, state_1, fill = mean_tversky)) +
+  geom_tile(colour = "grey90", linewidth = 0.2) +
+  facet_grid(~ condition) +
+  scale_fill_gradientn(colours = c("#FFFFFF", "#FFF3B0", "#F0A03C", "#C1272D",
+                                   "#7A1E5C", "#1A1033"),
+                       na.value = "grey85") +
+  coord_equal() +
+  labs(x = "found in state", y = "fraction of this state's clones",
+       fill = "Tversky index",
+       title = paste0(SUBSET_TITLE, ": clonal sharing between states"),
+       subtitle = "Asymmetric: row i, column j is the share of state i's clones also seen in state j. Diagonal excluded.") +
+  theme_tcr() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = rel(0.75)),
+        axis.text.y = element_text(size = rel(0.75)),
+        panel.grid = element_blank())
+p_tversky
+```
+
+```{r startrac}
+# subset(), not obj[, cells]: the bracket form drops reductions in Seurat v5.
+# Startrac does not need one, but obj_plot should behave the same way here as in
+# the main notebook.
+obj_plot <- subset(obj, cells = colnames(obj)[!obj$cell_label %in% drop_labels])
+Idents(obj_plot) <- factor(obj_plot$cell_label)
+
+startrac <- safe(StartracDiversity(obj_plot, type = "timepoint", group.by = "patient_id",
+                                   exportTable = TRUE),
+                 "startrac", "all", "startrac_indices")
+if (!is.null(startrac)) {
+  startrac <- as.data.frame(startrac)
+  if ("group" %in% names(startrac))
+    startrac <- startrac %>%
+      left_join(patient_meta %>% dplyr::select(patient_id, category),
+                by = c("group" = "patient_id")) %>%
+      dplyr::select(category, everything())
+  log_row("startrac", "all", "startrac_indices", NA_integer_, NA_integer_, nrow(startrac), "ok")
+  if ("majorCluster" %in% names(startrac))
+    cat("Startrac majorCluster values:",
+        paste(head(unique(startrac$majorCluster), 5), collapse = ", "), "\n")
+}
+```
+
+# Public clones
+
+The same CDR3 amino acid sequence in more than one patient is convergence, not
+shared lineage, and is reported separately from anything tracked. `CTaa` is used
+here and nowhere else.
+
+```{r public}
+public_clones <- md_v %>%
+  filter(!is.na(CTaa)) %>%
+  distinct(patient_id, CTaa) %>%
+  dplyr::count(CTaa, name = "n_patients") %>%
+  filter(n_patients >= 2) %>%
+  left_join(md_v %>% filter(!is.na(CTaa)) %>%
+              group_by(CTaa) %>%
+              summarise(n_cells = n(),
+                        patients   = paste(sort(unique(as.character(category))), collapse = ","),
+                        conditions = paste(sort(unique(as.character(condition))), collapse = ","),
+                        batches    = paste(sort(unique(batch)), collapse = ","),
+                        states     = paste(sort(unique(as.character(cell_label))), collapse = ","),
+                        .groups = "drop"), by = "CTaa") %>%
+  mutate(same_batch = !grepl(",", batches)) %>%
+  arrange(desc(n_patients), desc(n_cells))
+cat("Public CDR3aa clonotypes (>=2 patients):", nrow(public_clones),
+    "| confined to one batch:", sum(public_clones$same_batch), "\n")
+
+# if sharing concentrates in one patient pair AND that pair sits in one
+# sequencing batch, index hopping is more likely than convergent selection.
+pat_batch <- sample_meta %>% group_by(patient_id, category) %>%
+  summarise(batches = paste(sort(unique(batch)), collapse = ","), .groups = "drop")
+public_pairs <- md_v %>%
+  filter(!is.na(CTaa)) %>%
+  distinct(patient_id, CTaa) %>%
+  inner_join(., ., by = "CTaa", relationship = "many-to-many") %>%
+  filter(patient_id.x < patient_id.y) %>%
+  dplyr::count(patient_id.x, patient_id.y, name = "n_shared_aa") %>%
+  left_join(pat_batch, by = c("patient_id.x" = "patient_id")) %>%
+  rename(category_x = category, batches_x = batches) %>%
+  left_join(pat_batch, by = c("patient_id.y" = "patient_id")) %>%
+  rename(category_y = category, batches_y = batches) %>%
+  mutate(shared_batch = batches_x == batches_y) %>%
+  dplyr::select(category_x, category_y, n_shared_aa, batches_x, batches_y, shared_batch,
+                patient_id.x, patient_id.y) %>%
+  arrange(desc(n_shared_aa))
+print(as.data.frame(head(public_pairs, 10)))
+```
+
+# Family 1: CASE vs CTRL, patient level
+
+Timepoints of a patient are averaged into one number so the unit is the patient,
+exactly as counts are pooled per patient in the DEG notebook. A sensitivity fit
+excluding single-visit patients runs alongside.
+
+```{r family1}
+METRICS <- c("rare_shannon", "rare_eff_clones", "rare_inv_simpson", "rare_norm_entropy",
+             "rare_clonality", "rare_gini", "rare_n_clones", "rare_pct_expanded",
+             "rare_top10_pct")
+sm <- sample_metrics %>% filter(usable)
+
+pat_level <- sm %>%
+  group_by(category, patient_id, condition) %>%
+  summarise(across(all_of(METRICS), ~ mean(.x, na.rm = TRUE)),
+            n_samples = n(), .groups = "drop") %>%
+  left_join(patient_visits %>% dplyr::select(patient_id, single_visit), by = "patient_id") %>%
+  arrange(category)
+
+test_condition <- function(dat, tag) {
+  bind_rows(lapply(METRICS, function(m) {
+    x <- dat[[m]][dat$condition == "CASE"];   x <- x[is.finite(x)]
+    y <- dat[[m]][dat$condition == "CTRL"]; y <- y[is.finite(y)]
+    if (min(length(x), length(y)) < MIN_UNITS_PER_GROUP) {
+      log_row("condition", tag, m, length(x), length(y), NA_integer_, "skipped")
+      return(NULL)
+    }
+    w <- suppressWarnings(wilcox.test(x, y))
+    min_p <- min(2 / choose(length(x) + length(y), min(length(x), length(y))), 1)
+    log_row("condition", tag, m, length(x), length(y), length(x) + length(y),
+            if (min(length(x), length(y)) < 3) "exploratory" else "ok")
+    data.frame(analysis = tag, metric = m, n_CASE = length(x), n_CTRL = length(y),
+               mean_CASE = mean(x), mean_CTRL = mean(y), diff = mean(x) - mean(y),
+               rank_biserial = rb_effect(x, y), p_val = w$p.value,
+               min_possible_p = min_p, powered = min_p <= 0.05,
+               stringsAsFactors = FALSE)
+  }))
+}
+
+res_cond <- bind_rows(
+  test_condition(pat_level, "all_patients"),
+  test_condition(pat_level %>% filter(!single_visit), "multi_visit_only")) %>%
+  group_by(analysis) %>% mutate(p_val_adj = p.adjust(p_val, method = "BH")) %>% ungroup()
+print(as.data.frame(res_cond))
+```
+
+# Family 2: timepoint trajectories within a condition, paired
+
+Timepoint varies inside a patient, so the sample is the unit and the patient is a
+random intercept. `lmer(metric ~ timepoint + (1 | patient_id))` is the paired
+equivalent of the `~ patient_id + timepoint` design used for counts, fitted
+inside each condition separately. `TP_LEVELS` sets the reference, so every
+`timepointD14` coefficient means "T1 minus T0".
+
+```{r family2}
+fit_lmm <- function(d, form, family, unit, item) {
+  fit <- tryCatch(suppressMessages(lmerTest::lmer(form, data = d)), error = function(e) NULL)
+  if (is.null(fit)) {
+    log_row(family, unit, item, NA_integer_, NA_integer_, nrow(d), "skipped", "fit failed")
+    return(NULL)
+  }
+  cf <- as.data.frame(coef(summary(fit)))
+  cf$term <- rownames(cf); rownames(cf) <- NULL
+  names(cf)[names(cf) == "Pr(>|t|)"]  <- "p_val"
+  names(cf)[names(cf) == "Std. Error"] <- "se"
+  names(cf)[names(cf) == "Estimate"]   <- "estimate"
+  log_row(family, unit, item, NA_integer_, NA_integer_, nrow(d),
+          if (length(unique(d$patient_id)) < 3) "exploratory" else "ok")
+  cf %>% filter(term != "(Intercept)") %>%
+    dplyr::select(term, estimate, se, p_val) %>%
+    mutate(item = item, n_patients = length(unique(d$patient_id)), .before = 1)
+}
+
+res_within <- bind_rows(lapply(COND_LEVELS, function(cnd) {
+  d0 <- sm %>% filter(condition == cnd)
+  bind_rows(lapply(METRICS, function(m) {
+    d <- d0 %>% dplyr::select(patient_id, timepoint, value = all_of(m)) %>%
+      filter(is.finite(value))
+    d$timepoint <- droplevels(factor(as.character(d$timepoint), levels = TP_LEVELS))
+    keep <- names(which(table(d$patient_id) >= 2))   # one visit carries no within-patient info
+    d <- d %>% filter(patient_id %in% keep)
+    if (nlevels(d$timepoint) < 2 || length(unique(d$patient_id)) < MIN_UNITS_PER_GROUP) {
+      log_row("within_condition_timepoint", cnd, m, NA_integer_, NA_integer_, nrow(d), "skipped")
+      return(NULL)
+    }
+    out <- fit_lmm(d, value ~ timepoint + (1 | patient_id),
+                   "within_condition_timepoint", cnd, m)
+    if (is.null(out)) return(NULL)
+    cbind(condition = cnd, reference = levels(d$timepoint)[1], out)
+  }))
+}))
+if (!is.null(res_within) && nrow(res_within)) {
+  res_within$p_val_adj <- p.adjust(res_within$p_val, method = "BH")
+  print(as.data.frame(res_within))
+}
+```
+
+# Family 3: CASE vs CTRL at each timepoint, unpaired
+
+```{r family3}
+res_between <- bind_rows(lapply(TP_LEVELS, function(tp) {
+  d0 <- sm %>% filter(timepoint == tp)
+  bind_rows(lapply(METRICS, function(m) {
+    x <- d0[[m]][d0$condition == "CASE"];   x <- x[is.finite(x)]
+    y <- d0[[m]][d0$condition == "CTRL"]; y <- y[is.finite(y)]
+    if (min(length(x), length(y)) < MIN_UNITS_PER_GROUP) {
+      log_row("between_condition_timepoint", tp, m, length(x), length(y),
+              length(x) + length(y), "skipped")
+      return(NULL)
+    }
+    w <- suppressWarnings(wilcox.test(x, y))
+    min_p <- min(2 / choose(length(x) + length(y), min(length(x), length(y))), 1)
+    log_row("between_condition_timepoint", tp, m, length(x), length(y),
+            length(x) + length(y), if (min(length(x), length(y)) < 3) "exploratory" else "ok")
+    data.frame(timepoint = tp, metric = m, n_CASE = length(x), n_CTRL = length(y),
+               mean_CASE = mean(x), mean_CTRL = mean(y), diff = mean(x) - mean(y),
+               rank_biserial = rb_effect(x, y), p_val = w$p.value,
+               min_possible_p = min_p, powered = min_p <= 0.05,
+               stringsAsFactors = FALSE)
+  }))
+}))
+if (!is.null(res_between) && nrow(res_between)) {
+  res_between$p_val_adj <- p.adjust(res_between$p_val, method = "BH")
+  print(as.data.frame(res_between))
+}
+```
+
+# Family 4: condition x timepoint interaction
+
+Whether the CASE repertoire *changes differently* from CTRL. Patient is nested
+inside condition, so it enters as a random intercept rather than a fixed effect,
+for the same reason as in the DEG interaction model. A timepoint is included
+only if both arms have at least `MIN_UNITS_PER_GROUP` patients there.
+
+```{r family4}
+pat_tp <- sm %>% distinct(patient_id, condition, timepoint) %>%
+  dplyr::count(condition, timepoint, name = "n_pat")
+tp_intx <- intersect(TP_LEVELS, Reduce(intersect, lapply(COND_LEVELS, function(cnd)
+  as.character(pat_tp$timepoint[pat_tp$condition == cnd & pat_tp$n_pat >= MIN_UNITS_PER_GROUP]))))
+cat("Timepoints in the interaction model:", paste(tp_intx, collapse = ", "), "\n")
+
+res_intx <- if (length(tp_intx) >= 2) bind_rows(lapply(METRICS, function(m) {
+  d <- sm %>% filter(timepoint %in% tp_intx) %>%
+    dplyr::select(patient_id, condition, timepoint, value = all_of(m)) %>%
+    filter(is.finite(value))
+  d$timepoint <- droplevels(factor(as.character(d$timepoint), levels = tp_intx))
+  d$condition <- droplevels(factor(as.character(d$condition), levels = COND_LEVELS))
+  if (nlevels(d$timepoint) < 2 || nlevels(d$condition) < 2 ||
+      length(unique(d$patient_id)) < 3) {
+    log_row("condition_by_timepoint_interaction", "all", m, NA_integer_, NA_integer_,
+            nrow(d), "skipped")
+    return(NULL)
+  }
+  out <- fit_lmm(d, value ~ condition * timepoint + (1 | patient_id),
+                 "condition_by_timepoint_interaction", "all", m)
+  if (is.null(out)) return(NULL)
+  cbind(reference = levels(d$timepoint)[1], out)
+})) else NULL
+
+if (!is.null(res_intx) && nrow(res_intx)) {
+  res_intx$p_val_adj <- p.adjust(res_intx$p_val, method = "BH")
+  res_intx$is_interaction <- grepl(":", res_intx$term)
+  print(as.data.frame(res_intx %>% filter(is_interaction)))
+}
+```
+
+```{r metric-plots, fig.width = 11, fig.height = 6}
+long <- sm %>%
+  dplyr::select(category_plot, category, patient_id, condition, timepoint, all_of(METRICS)) %>%
+  pivot_longer(all_of(METRICS), names_to = "metric", values_to = "value")
+p_metric_traj <- ggplot(long, aes(timepoint, value, group = category, colour = condition)) +
+  geom_line(alpha = 0.6) + geom_point(size = 1.5) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_colour_manual(values = PAL_COND) +
+  labs(x = NULL, y = NULL, colour = NULL,
+       title = paste0(SUBSET_TITLE, ": rarefied repertoire metrics")) +
+  theme_tcr() + theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+print(p_metric_traj)
+
+p_metric_box <- ggplot(long, aes(condition, value, colour = condition)) +
+  geom_boxplot(aes(fill = condition), alpha = 0.15, outlier.shape = NA, linewidth = 0.4) +
+  geom_point(position = position_jitter(width = 0.15), size = 1.5, alpha = 0.85) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_colour_manual(values = PAL_COND, guide = "none") +
+  scale_fill_manual(values = PAL_COND, guide = "none") +
+  labs(x = NULL, y = NULL, title = paste0(SUBSET_TITLE, ": metrics by condition, all samples")) +
+  theme_tcr()
+print(p_metric_box)
+```
+
+# Write the figures
+
+```{r figures-pdf, results = FALSE}
+pdf(file.path(fig_dir, "subset_data_diversity.pdf"), width = 11, height = 6)
+print(p_rarecurve); print(p_renyi); print(p_gini)
+print(p_metric_traj); print(p_metric_box)
+invisible(dev.off())
+
+pdf(file.path(fig_dir, "subset_data_clonal_tracking.pdf"), width = 12, height = 7)
+if (!is.null(p_overlap)) print(p_overlap)
+if (!is.null(p_traj))    print(p_traj)
+print(p_biplot)
+invisible(dev.off())
+
+pdf(file.path(fig_dir, "subset_data_clone_sharing.pdf"), width = 11, height = 6)
+print(p_tversky)
+invisible(dev.off())
+```
+
+# Write the workbook
+
+Every table is listed once, here, after all of it has been computed. Nothing
+accumulates in a global as the notebook runs, so re-running a chunk cannot
+corrupt the workbook. Analyses that were skipped leave a NULL and are reported
+by name rather than silently vanishing; the manifest is still the full record.
+
+```{r write}
+manifest <- bind_rows(MANIFEST)
+
+sheet <- function(d, desc) {
+  if (is.null(d)) return(NULL)
+  d <- as.data.frame(d)
+  if (!nrow(d)) return(NULL)
+  list(d = d, desc = desc)
+}
+
+BOOK <- list(
+  rarefaction_curves = sheet(
+    rare_curve %>% mutate(richness = round(richness, 1)) %>%
+      dplyr::select(category_plot, sample_origin, condition, timepoint, depth, richness),
+    "Mean observed clonotype richness at each subsampling depth, 20 draws per point."),
+  sample_metrics = sheet(sample_metrics,
+    "One row per sample. raw_* = as sequenced, rare_* = rarefied (the models use these), trb_* = beta-only sensitivity."),
+  beta_only_sensitivity = sheet(
+    sens %>% dplyr::select(category_plot, sample_origin, condition, timepoint,
+                           pct_beta_only, rare_n_clones, trb_n_clones,
+                           rare_clonality, trb_clonality),
+    "The two clone calls side by side. Large disagreement means alpha dropout is driving a result."),
+  renyi_profiles = sheet(
+    renyi_tbl %>% mutate(renyi = round(renyi, 4), renyi_sd = round(renyi_sd, 4)) %>%
+      dplyr::select(category_plot, sample_origin, condition, timepoint,
+                    alpha, renyi, renyi_sd),
+    "Rarefied Renyi entropy at each alpha, per sample. alpha=0 is log richness, alpha=1 is Shannon, alpha=Inf is -log of the largest clone's share."),
+  renyi_condition_tests = sheet(renyi_tests,
+    "CASE vs CTRL at each Renyi alpha, patient as the unit. alpha=1 is the Shannon comparison."),
+  state_metrics_by_sample = sheet(state_metrics,
+    "Diversity within each cell state of each sample. Not rarefied, so compare within a sample rather than across."),
+  overlap_between_visits = sheet(overlap_tp,
+    "Repertoire overlap between two visits of the same patient. Report morisita; morisita_trb is the beta-only check."),
+  clone_sizes_between_visits = sheet(
+    biplot_dat %>% dplyr::select(category, condition, pair, x, y, status),
+    "Every clone's size at two consecutive visits of one patient. The data behind the biplots."),
+  persistence_by_patient = sheet(persist_summary,
+    "Percent of a patient's clones seen at 2+ visits. NA where the patient has one sequenced visit: a structural zero, not a finding."),
+  persistent_clones = sheet(persistent_clones,
+    "Every clone seen at 2+ visits of one patient, with its size, visits and states."),
+  top_clone_trajectories = sheet(traj_top,
+    "Per-visit frequency of each patient's ten largest clones. The data behind the trajectory figure."),
+  sharing_between_states = sheet(state_sharing,
+    "Clones shared between two cell states within a patient. overlap_coef is symmetric; tversky is the fraction of state_1's clones found in state_2."),
+  sharing_states_mean = sheet(state_sharing_mean,
+    "The same matrices averaged over patients. This is the version plotted."),
+  startrac_indices = sheet(startrac,
+    "expa = expansion, migr = cross-timepoint movement, tran = cross-state transition, per state per patient."),
+  public_clones_aa = sheet(public_clones,
+    "CDR3aa shared by 2+ patients. same_batch TRUE means every cell came from one sequencing batch, which is what index hopping looks like."),
+  public_sharing_by_pair = sheet(public_pairs,
+    "CDR3aa shared by each pair of patients, and whether that pair sits in the same batch. Concentration in one same-batch pair is a technical warning, not a finding."),
+  patient_level_metrics = sheet(pat_level,
+    "One row per patient, timepoints averaged. single_visit flags a patient whose average is really one sample."),
+  condition_patient_level = sheet(res_cond,
+    "CASE vs CTRL, patient as the unit. Read diff and rank_biserial; powered FALSE means no p here could have reached 0.05."),
+  within_cond_timepoint = sheet(res_within,
+    "Trajectory inside each arm. Coefficients are differences from the reference timepoint in the reference column."),
+  between_cond_per_timepoint = sheet(res_between,
+    "CASE vs CTRL separately at each visit, unpaired. Same power caveat as condition_patient_level."),
+  design_patients_per_cell = sheet(pat_tp,
+    "Patients contributing to each condition x timepoint cell. The design behind every skipped row in the manifest."),
+  cond_by_timepoint_intx = sheet(res_intx,
+    "Full coefficient table. Filter is_interaction TRUE for the terms that answer the question."),
+  run_manifest = sheet(manifest,
+    "Every step attempted, with status ok / exploratory / skipped. A skipped analysis is otherwise indistinguishable from an empty one.")
+)
+
+wb <- createWorkbook()
+for (nm in names(BOOK)) {
+  s <- BOOK[[nm]]
+  if (is.null(s)) { cat("empty or skipped, not written:", nm, "\n"); next }
+  stopifnot(nchar(nm) <= 31)
+  addWorksheet(wb, nm)
+  writeData(wb, nm, s$desc, startRow = 1, startCol = 1, colNames = FALSE)
+  writeData(wb, nm, s$d,    startRow = 3, rowNames = FALSE)
+  freezePane(wb, nm, firstActiveRow = 4)
+}
+f <- file.path(clone_root, "subset_data_clonal_TCR_stats.xlsx")
+saveWorkbook(wb, f, overwrite = TRUE)
+cat("wrote", basename(f), "-", sum(!vapply(BOOK, is.null, logical(1))), "sheets\n")
+
+print(as.data.frame(manifest))
+cat("\nSteps run:", sum(manifest$status != "skipped"),
+    " skipped:", sum(manifest$status == "skipped"), "\n")
+```

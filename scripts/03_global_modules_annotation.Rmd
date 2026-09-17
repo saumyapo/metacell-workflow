@@ -1,0 +1,923 @@
+---
+title: "03 Global gene modules and block annotation"
+author: "Saumya Pothukuchi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: cosmo
+#    number_sections: true #adds numbers to headers
+    code_folding: hide
+---
+
+
+```{r}
+library(Seurat)
+# run conda install conda-forge::zstd command line if there is a "UserWarning: zstandard could not be imported. Running without .conda support" errro + restart R session
+# unloadNamespace("anndata")
+# unloadNamespace("reticulate")
+# unloadNamespace("Matrix")
+# unloadNamespace("Seurat")
+library(reticulate)
+# point reticulate at the env built from env/metacell.yml
+reticulate::use_condaenv("metacell", required = TRUE)
+library(anndata)
+library(ggplot2)
+library(ggrepel)
+library(SCpubr)
+```
+
+# Configuration
+
+```{r, results = FALSE, message = FALSE, warning = FALSE}
+# Paths, factor levels and palettes all come from config/config.R so this
+# notebook and the composition / DE steps cannot drift apart.
+source(file.path("..", "config", "config.R"))
+
+SUBSET_SLUG <- "global"
+FILE_PREFIX <- "global"
+
+# where this step reads from and writes to
+h5ad_dir <- file.path(DIR_H5AD, SUBSET_SLUG, "metacell")
+rds_dir  <- out_dirs(SUBSET_SLUG, "rds")
+csv_dir  <- out_dirs(SUBSET_SLUG, "csv")
+fig_dir  <- out_dirs(SUBSET_SLUG, "pdf")
+
+# the two objects written by 02
+CELLS_H5AD <- file.path(h5ad_dir, "project.clean_cells.h5ad")
+MC_H5AD    <- file.path(h5ad_dir, "project.metacells.h5ad")
+
+# Number of gene modules cut from the gene-gene correlation tree. Set here
+# because it appears in every intermediate filename as well as in the cutree
+# call, and the two must not drift.
+NCLUST <- 100
+
+# helper so every intermediate lands in rds_dir with a consistent stem
+rdsf <- function(tag, ext = "rd")
+  file.path(rds_dir, sprintf("%s_%s_%dmods.%s", FILE_PREFIX, tag, NCLUST, ext))
+```
+
+# Part 1. Cell-level QC
+
+Plots only. Cells were already filtered upstream, so nothing here drops anything;
+the point is to see whether one sample sits apart from the others before its
+metacells are trusted. See docs/13_diagnostics.md.
+
+## Output directory for QC figures
+
+```{r}
+output_dir <- fig_dir
+```
+
+## Read the cell object
+```{r}
+cdata = anndata::read_h5ad(CELLS_H5AD)
+```
+
+
+## Prepare the matrix
+```{r}
+colnames(cdata$X) = cdata$var_names
+rownames(cdata$X) = cdata$obs_names
+remvlist <- which(Matrix::colSums(cdata$X) == 0) #removes absent genes
+mdatarm <- cdata$X[, -remvlist]
+
+mdatarm
+```
+
+
+## Mitochondrial fraction per sample
+```{r}
+mydata <- data.frame(Perct_mito = cdata$obs$percent_mito, Cond = cdata$obs$sample_origin)
+
+ggplot(mydata, aes(x = Cond, y = Perct_mito)) + 
+  geom_boxplot() + 
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+```
+
+## Sequencing depth per sample
+```{r}
+mydata <- data.frame(Reads = cdata$obs$total_umis, Cond = cdata$obs$sample_origin)
+
+ggplot(mydata, aes(x = Cond, y = Reads)) + 
+  geom_boxplot() + 
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+```
+
+## Genes detected per cell
+```{r}
+cdata$obs$n_genes <- Matrix::rowSums(cdata$X > 0)
+
+ggplot(cdata$obs, aes(x = sample_origin, y = n_genes)) + 
+  geom_boxplot() + 
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+```
+
+# Part 2. Gene modules
+
+Everything below runs on the metacell object, not the cell object. Genes that
+co-vary across metacells are grouped into modules, and each metacell is scored on
+every module. Method and the reasoning behind each threshold:
+docs/07_annotation.md and docs/06_parameters.md.
+
+```{r}
+output_dir <- fig_dir
+```
+
+## Read the metacell object
+
+```{r}
+mdata = anndata::read_h5ad(MC_H5AD)
+```
+
+## Prepare the matrix
+```{r}
+colnames(mdata$X) = mdata$var_names
+rownames(mdata$X) = mdata$obs_names
+remvlist = which(Matrix::colSums(mdata$X)==0) 
+#remvlist
+mdatarm = mdata$X[, -remvlist] 
+
+#Useful in the next steps
+total = CreateSeuratObject(t(mdatarm), min.cells = 0, min.features = 0) 
+```
+
+## Mean-dispersion LOESS fit and HVG selection
+
+```{r}
+ds = t(mdatarm) #The matrix is transposed so that genes become rows and metacells columns
+ds_mean = Matrix::rowMeans(ds) #Calculates the mean expression of each gene across all metacells
+ds_var = apply(ds, 1, var) #Calculates the variance of each gene across all metacells
+
+varmean_df = data.frame(m = ds_mean, v = ds_var, gene = rownames(ds))   # Creation of a data frame containing for each gene, its name ("gene") as well as its mean expression ("m") and variance ("v") across all metacells
+```
+
+```{r}
+x = log10(varmean_df$m) #Abundance: Applies log10 to the mean expression of each gene. Gene expression is normalized by M 0.9.5 so that the sum of gene expression within each metacell is 1, so mean expression of each gene across all metacells is going to be < 1 (mean of frequencies), and the logarithm is going to be negative, which allows a better spreading of mean expression values than with a linear scale
+lv = log2(varmean_df$v / varmean_df$m) #Dispersion = log2(variance/mean). Variance rises with the mean, so ranking on variance alone selects only abundant genes.
+breaks = seq(min(x), max(x),.2)   # Segments the range of values of x (=log10(mean)) for loess (LOcally Estimated Scatterplot Smoothing) curve calculation. Each range now includes genes with similar level of expression
+z = sapply(split(lv, cut(x, breaks)), min, na.rm = T) #Minimum dispersion per expression bin: the technical noise floor at that abundance, i.e. a non-variable gene.
+maskinf = is.infinite(z) #Remove intervales with infinite minimum dispersion
+z = z[!maskinf]
+b = breaks[-length(breaks)] #Keep only the corresponding interval boundaries
+b = b[!maskinf]
+lo = loess(z~b) #Calculation of the loess curve for z (the minimum value of dispersion for a given interval). Models the background noise as a function of the expression level.
+
+inVarMean_MeanThresh = -9
+# example: on one global run range(x) was about -10.8 to -1.6
+
+#Aiming for 3k HVGs isntead of standard 2k
+inVarMean_varmeanThresh = 3.67
+
+n_genes <- function(thresh){
+  lline2 = predict(lo, newdata = log10(varmean_df$m))
+  sum(log10(varmean_df$m) > as.numeric(inVarMean_MeanThresh) & log2(varmean_df$v/varmean_df$m) > lline2 + as.numeric(thresh), na.rm = TRUE)
+}
+
+thresholds <- seq(3.65, 3.7, by = 0.01)
+sapply(thresholds, n_genes)
+```
+
+```{r}
+#pdf(paste0(output_dir, "mean_dispersion_loess.pdf"))
+plot(x, lv, xlab = "Log10(mean)", ylab = "log2(var/mean)", panel.first = grid())   # Make a data plot with genes as dots according to their log10(mean) and dispersion as coordinates
+x1 = seq(-10, 0, l = 100)   # Creates a sequence for the range of the X axis that will be used for the loess curve (smaller intervals than previously with 'breaks', about 100 intervals)
+lline = predict(lo, newdata = x1)   # If range(x) This predicts a new loess curve for each x1 value
+lines(x1, lline + as.numeric(inVarMean_varmeanThresh), col = 2)   # Draws a line joining all the points at LOESS + threshold
+abline(v = inVarMean_MeanThresh, col = 2)   # Draws a vertical line for the other threshold (minimum mean expression to select a gene for module calculation). Prevents genes with very low expression from being selected.
+lline2 = predict(lo, newdata = log10(varmean_df$m)) #Actually predicts the minimal dispersion expected for each gene
+#dev.off()
+```
+
+```{r}
+geneModuleMask = log10(varmean_df$m)>as.numeric(inVarMean_MeanThresh) & log2(varmean_df$v/varmean_df$m)>lline2+as.numeric(inVarMean_varmeanThresh)   # Create a mask of the gene modules that will actually be used for the calculation of gene modules
+table(geneModuleMask)
+
+effivar = rownames(varmean_df)[which(geneModuleMask==T)]   # Get HVG gene names
+
+# carry lateral/noisy masks into the metacell-level module HVG selection
+get_mask <- function(v, col){ m <- as.logical(v[[col]]); m[is.na(m)] <- FALSE; rownames(v)[m] }
+mask_src  <- if (all(c("lateral_gene","noisy_gene") %in% colnames(mdata$var))) mdata$var else cdata$var
+lat_noisy <- union(get_mask(mask_src, "lateral_gene"), get_mask(mask_src, "noisy_gene"))
+
+
+n0 <- length(effivar)
+effivar <- setdiff(effivar, lat_noisy)
+cat(sprintf("module HVGs: %d -> %d after dropping %d lateral/noisy\n", n0, length(effivar), n0 - length(effivar)))
+
+ds_select <- ds[effivar, ]
+
+min(rowSums(ds[which(rownames(ds)%in%effivar),])) # example value from one run: ~1e-05
+ds_select = ds[effivar,] # Subset the whole dataset to contain only the selected genes (as rows, and all the metacells as columns)
+
+# geneModuleMask
+# FALSE  TRUE 
+```
+
+## Gene-gene correlations and module cutting
+
+```{r}
+nclust <- NCLUST
+res2 = cor(as.matrix(t(ds_select)), method = c("pearson"))   # Pearson correlation between all gene pairs (matrix is transposed, so columns are genes)
+res2_dist = dist(res2, method = 'euclidean')   # Returns the distance matrix of the correlation matrix (= computes the euclidean distances between the rows of the correlation matrix) => 2 genes with very similar correlation values to each other gene will be "close"
+res2_clust = hclust(res2_dist, method = 'complete')   # Compute hierarchical clustering of the genes based on the distance matrix
+res2_cut = cutree(res2_clust, k = nclust)   # Cuts the tree resulting from the hierarchical clustering so as to produce k (= 100) clusters - result is a named vector indicating for each gene the cluster it belongs to (number, index-like)
+```
+
+## Gene to module table
+```{r}
+dfcut = as.data.frame(names(res2_cut))   # 1986 HVGs post filtering
+dfcut$related_genes_module = res2_cut   # Adds a column with the corresponding cluster (= module) for each gene
+colnames(dfcut) = c("X","related_genes_module")   # Renames columns for the dataframe (first one named "X" now, and second one "related_genes_module")
+```
+
+## Gene module objects
+
+```{r}
+newmod = c()   # create null vector
+for(i in 1:nclust){
+  newmod = append(newmod, paste0("My_Mod_",i))
+}   # Creates a vector containing the names of gene modules (My_Mod_<nb>)
+
+for(i in levels(as.factor(dfcut$related_genes_module))){   # For each module (strings here, instead of numbers in the previous loop) :
+  assign(paste0("My_Mod_",i), dfcut$X[which(dfcut$related_genes_module==i)])   # Create a vector named after the module, containing the names of the genes it contains
+}
+
+allmod = c()
+alllist = list()   # Create an empty vector and an empty list
+for(i in 1:nclust){   # For each cluster :
+  submod = data.frame(Mod=paste0(newmod[i]),Gen=paste0(eval(as.name(newmod[i]))))   # eval() extracts the name of the module (newmod[i]) as an object name in R, so basically this creates a n-row dataframe where the 1st column is always the name of the gene module, and the 2nd column contains all the names of the genes inside that module (long format data.frame)
+  allmod = rbind(allmod,submod)   # This new data.frame is added to the aggregated object with all the previous ones (empty if first iteration)
+  alllist[i] = list(paste0( paste0(eval(as.name(newmod[i])),collapse=",") ) )   # Creates an additional string in the alllist, containing the names of all the genes from the corresponding gene module, separated by comas
+}   # allmod and alllist hold the same gene-per-module information in two shapes
+
+genelist = data.frame(Mods = newmod, Gens = unlist(alllist))   # Combines newmod (vector of module names) and alllist (list of strings, each including all genes of a module) in a single data.frame
+save(genelist, file = rdsf("genelist"))
+```
+
+## Module scores across metacells
+
+```{r}
+# First remove previous module scores if they exist
+cols_remove <- grepl("^My_Mod_.*_(score|scaled)$", colnames(total@meta.data))
+total@meta.data <- total@meta.data[, !cols_remove]
+
+for(i in newmod){   # For each module :
+  print(paste0("---- Working on ", i, " ----"))
+  ilist = unlist(strsplit(genelist$Gens[which(genelist$Mods==i)],split = ","))   # Extracts the list of genes within the considered module (by splitting the string from genelist) and unlists it (= converts it into a vector)
+  
+  if(length(ilist)<2) {   # If there are less than 2 genes in this module (so only 1 basically) :
+    values = ( log(1+total@assays$RNA$counts[intersect(ilist,rownames(total)),]) / colSums(log(1+total@assays$RNA$counts)) )   # Same as below but only for this one gene, so no need for colSums() at the numerator
+    eval(parse(text=paste0("total@meta.data$",i,"_score = values")))
+  } else {   # Otherwise, if more than 1 gene :
+    values = ( colSums(log(1+total@assays$RNA$counts[intersect(ilist,rownames(total)),])) / colSums(log(1+total@assays$RNA$counts)) )   # Obtains a numeric vector : ratio between [total expression of the genes of this module in each metacell (named numeric vector)] and [total expression of all non-excluded genes (25000 from the beginning)]   
+    eval(parse(text=paste0("total@meta.data$",i,"_score = values")))   # Eval here allows to enter the text as if it were a command : adds the content of the "values" object (= for each metacell, fraction of total non-excluded gene expression attributed to genes of this module) to a slot (i) in the metadata of the total Seurat object
+  }
+}
+
+for(i in newmod){   # For each module :
+  eval(parse(text = paste0("total@meta.data$", i, "_scaled = as.vector(scale(total@meta.data$", i, "_score, center = TRUE, scale = TRUE))")))   # Add a slot for the corresponding gene module in the Seurat metadata, which is the scaled value of the scores of the corresponding module across metacells = centers and scales (z-score) within each module
+}
+```
+
+## Save the gene x metacell matrix
+
+```{r}
+dgcmtxcounts = as(total@assays$RNA$counts, "dgCMatrix")
+save(dgcmtxcounts, file = rdsf("counts"))
+```
+
+## Extract metadata
+
+```{r}
+metadf = as.data.frame(total@meta.data)   # Extract the metadata as a data.frame
+for(i in newmod){   # For each module :
+  eval(parse(text = paste0("metadf$", i, "_score = NA")))
+  eval(parse(text = paste0("metadf$", i, "_score[match(colnames(total),rownames(metadf))] = total@meta.data$", i, "_score")))   # The match() part is useful in case there is a discrepancy between the metacells in the Seurat object and in the metadata df (don't see why that would happen but I guess it did at some point)
+}   # Replaces the score values in the metadata df with those of the Seurat object metadata (again, don't see why they would not correspond, but I guess some discrepancy happened at some point which required this kind of regularization)
+
+metadf_z = metadf   # already z-scored in the module scoring chunk above
+save(metadf_z, file = rdsf("metadata"))
+```
+
+# Part 3. Module score heatmap and metacell blocks
+
+The module-score matrix is cut into `column_km` k-means groups. Those groups are
+the blocks, and the blocks are what get cell type labels. `column_km` is the
+resolution knob and is tuned by looking: see docs/07_annotation.md.
+
+## Libraries and output directories
+```{r}
+library(heatmaply)
+library(ggplot2)
+library(scales)
+library(ComplexHeatmap)
+library(circlize)
+
+output_dir_res <- csv_dir
+output_dir_fig <- fig_dir
+```
+
+## Load objects
+
+```{r}
+load(rdsf("counts"))   # dgcmtxcounts
+load(rdsf("genelist"))   # genelist
+load(rdsf("metadata"))   # metadf_z
+```
+
+## Build the heatmap and cut blocks
+
+```{r}
+hm_zmod <- metadf_z[, grepl("_scaled$", colnames(metadf_z))]
+
+thmz = t(hm_zmod)   # Transposes the selected metadata matrix : metacells are columns now, and module scores are rows
+set.seed(42)   # Set seed
+col_fun <- colorRamp2(
+  c(-2, 0, 2),
+  c("navy", "white", "firebrick")
+)
+#column_km = 40, means 40 metacell groups, aka split metacells into 40 groups. This is like the "res" parameter, and is adjusted for when the heatmap looks "good"
+ht = draw(Heatmap(thmz, col=col_fun, column_title = "Module clustering based on corrected z score", name = "mat",
+                  row_names_gp = gpar(fontsize = rel(400/length(colnames(hm_zmod)))), show_row_dend = TRUE,
+                  row_dend_reorder = FALSE, cluster_rows = TRUE, row_order = NULL,
+                  column_dend_reorder = FALSE, cluster_columns = TRUE, show_column_names = FALSE, column_names_gp = gpar(fontsize = rel(400/length(rownames(hm_zmod)))), column_km = 40, row_km = 0, use_raster = TRUE) )   # Draws the heatmap from the matrix
+save(ht, file = rdsf("HMlist"))
+```
+
+```{r}
+# pdf(file = paste0(output_dir_fig, paste0(FILE_PREFIX, "_HM_", NCLUST, "mods.pdf")), width = 12, height = 8  )
+# ht
+# dev.off()
+```
+
+```{r}
+htmxord = thmz[ as.vector(unlist(row_order(ht))), as.vector(unlist(column_order(ht))) ]   # Reorders rows and columns of the thmz matrix according to the order on the heatmap (was reordered due to clustering)
+save(htmxord, file = rdsf("htmxord"))
+```
+
+
+# Pull which genes are in the module
+
+```{r}
+newmod <- genelist$Mods
+sapply(newmod, function(m) paste(head(unlist(strsplit(genelist$Gens[genelist$Mods==m], ",")), 8), collapse=", "))
+
+# Get info regarding 40 metacell groups/blocks, like how many metacells are in each block.
+cl <- column_order(ht)  # a list of 40 vectors of column indices
+block <- integer(ncol(thmz)); for (k in seq_along(cl)) block[cl[[k]]] <- k
+names(block) <- colnames(thmz)   # metacell -> block number (1..40)
+table(block)
+
+# Map block to module, to understand which modules are driving which blocks - helps in anntoations
+blockmeans <- t(apply(thmz, 1, function(r) tapply(r, block, mean)))  # module × block mean z
+apply(blockmeans, 2, function(col) names(sort(col, decreasing=TRUE))[1:5])  # top 5 modules per block
+```
+```{r}
+# Tab 1: every module and its full gene list
+modules_genes <- data.frame(
+  module = genelist$Mods,
+  genes  = gsub(",", ", ", genelist$Gens),   # full list, comma-space separated
+  stringsAsFactors = FALSE
+)
+
+# Tab 2: all modules per block, ranked by descending block mean z (no top-5 cap)
+block_rank <- as.data.frame(
+  apply(blockmeans, 2, function(col) names(sort(col, decreasing = TRUE))),
+  stringsAsFactors = FALSE
+)
+colnames(block_rank) <- paste0("block_", seq_len(ncol(block_rank)))
+# drop the _scaled suffix to match tab 1 module names:
+# block_rank[] <- lapply(block_rank, sub, pattern = "_scaled$", replacement = "")
+
+# Both tabs, one workbook
+out_xlsx <- file.path(csv_dir, paste0(FILE_PREFIX, "_module_block_map.xlsx"))
+openxlsx::write.xlsx(
+  list(modules_genes = modules_genes, block_module_ranking = block_rank),
+  file = out_xlsx, rowNames = FALSE
+)
+```
+
+
+# Annotation heatmap with global markers
+
+```{r}
+library(ComplexHeatmap); library(circlize)
+
+# PBMC lineage markers. "CD4","CD40LG","FOXP3" not picked up
+panel <- list(
+  "T cells"      = c("CD2","CD7","CD3G","CD3D","CD3E","IL7R","CD8A","CD8B","GZMK","GZMB","GNLY","NKG7","PRF1"),
+  "NK"           = c("KLRF1","NCAM1","SPON2","KLRD1","TYROBP"),
+  "B cells"      = c("CD19","MS4A1","CD22","PAX5","CD79B","BANK1","EBF1"),
+  "Plasma cells" = c("MZB1","XBP1","JCHAIN","TNFRSF17"),
+  "Granulocytes" = c("MS4A2","CPA3","HDC","GATA2"),
+  "Mo/Macs"      = c("CD14","LYZ","FCN1","CSF1R","S100A9","CD68", "NLRP3", "ACSL1", "BCL2A1", "ICAM1", "NINJ1"),
+  "moDCs"        = c("ITGAX","HLA-DRA","HLA-DQA1","CD1C","FCER1A","CLEC10A"),
+  "pDCs"         = c("IL3RA","TLR9","LILRA4","CLEC4C"),
+  "Platelet"     = c("PPBP","PF4"),
+  "Cycling"      = c("MKI67","STMN1")
+)
+
+# lineage-specific scoring signatures
+# lineage-specific scoring signatures
+sig <- lapply(list(
+  "T cells"      = c("CD3D","CD3E","CD2"),
+  "NK"           = c("KLRF1","NCAM1","SPON2"),          # no TYROBP/KLRD1: both are high in Mo/Mac
+  "B cells"      = c("CD19","MS4A1","BANK1"),
+  "Plasma cells" = c("MZB1","XBP1"),
+  "Granulocytes" = c("MS4A2","CPA3","HDC","CD177","ALPL","CYP4F3","ADGRG3"),  # was mast/baso only
+  "Mo/Macs"      = c("CD14","LYZ","FCN1","NLRP3","ACSL1"),
+  "moDCs"        = c("CD1C","FCER1A","CLEC10A"),
+  "pDCs"         = c("IL3RA","LILRA4","CLEC4C"),
+  "Platelet"     = c("PPBP","PF4"),
+  "Cycling"      = c("MKI67","STMN1")
+), function(g) intersect(g, rownames(dgcmtxcounts)))
+print(lengths(sig)); stopifnot(all(lengths(sig) > 0))
+
+markers <- unlist(panel, use.names = FALSE)
+row_lin <- rep(names(panel), lengths(panel))
+keep    <- markers %in% rownames(dgcmtxcounts)
+markers <- markers[keep]; row_lin <- factor(row_lin[keep], levels = names(panel))
+
+veto_T  <- intersect(c("CD3D","CD3E","CD3G","CD2","TRAC"), rownames(dgcmtxcounts))
+veto_NK <- intersect(c("KLRF1","NCAM1","SPON2"), rownames(dgcmtxcounts))
+
+score_genes <- union(markers, unlist(c(sig, list(veto_T, veto_NK)), use.names = FALSE))
+libsize <- Matrix::colSums(dgcmtxcounts)
+lognorm <- as.matrix(log1p(t(t(dgcmtxcounts[score_genes, ]) / libsize * 1e4)))
+stopifnot(identical(colnames(lognorm), names(block)))
+
+blk   <- t(apply(lognorm, 1, function(r) tapply(r, block, mean)))
+score <- sapply(sig, function(g) colMeans(blk[g, , drop = FALSE]))
+z <- scale(score); z[is.na(z)] <- 0
+stopifnot(identical(rownames(z), colnames(blk)), identical(colnames(z), names(sig)))
+
+call <- colnames(z)[max.col(z, "first")]
+s    <- t(apply(z, 1, sort, decreasing = TRUE))
+call[s[,1] < 0] <- "Undefined"
+
+# CD3 decides the T/NK boundary in both directions, on absolute log-CP10K
+CD3_MIN <- 1.0
+cd3 <- colMeans(blk[veto_T,  , drop = FALSE])
+nk  <- colMeans(blk[veto_NK, , drop = FALSE])
+bad_T  <- call == "T cells" & (cd3 < CD3_MIN | nk > cd3)
+call[bad_T & nk >= CD3_MIN] <- "NK"
+call[bad_T & nk <  CD3_MIN] <- "Undefined"
+bad_NK <- call == "NK" & cd3 >= CD3_MIN & cd3 > nk
+call[bad_NK] <- "T cells"
+cat("T vetoed:", sum(bad_T), " NK vetoed:", sum(bad_NK), "\n")
+
+block_anno <- setNames(call, rownames(z))
+print(block_anno)
+# every block, not just the flagged ones, so this does not need another pass
+diag <- data.frame(block = rownames(z), call = call,
+                   best = round(s[,1], 2), margin = round(s[,1] - s[,2], 2),
+                   cd3 = round(cd3, 2), nk = round(nk, 2),
+                   umis = round(tapply(libsize, block, median)))
+print(diag[order(diag$call, -diag$best), ], row.names = FALSE)
+
+
+# order + split columns by lineage
+lin_order <- c(names(panel), "Undefined")
+anno <- factor(block_anno[as.character(block)], levels = lin_order)
+ord  <- order(anno, block); ord <- ord[!is.na(anno[ord])]
+
+# color: row z (diverging) or absolute (quantile viridis)
+scale_rows <- TRUE
+if (scale_rows) {
+  mat <- t(scale(t(lognorm[markers, ord]))); mat[mat > 2.5] <- 2.5; mat[mat < -2.5] <- -2.5
+  col_fun <- colorRamp2(c(-2,0,2), c("#3B4CC0","#F7F7F7","#B40426")); hm_name <- "z-scaled"
+} else {
+  mat <- lognorm[markers, ord]
+  col_fun <- colorRamp2(quantile(mat, c(0,.5,.9,.99), na.rm=TRUE), viridisLite::viridis(4)); hm_name <- "logExpr"
+}
+
+lineage_cols <- setNames(
+  c("#8B1A1A","#4E9E2F","#2C6FAD","#E69F00","#2D6A4F","#9E79C4","#56B4E9","#A0522D","#CC79A7","#8C8C8C","#B2182B"),
+  lin_order)
+top <- HeatmapAnnotation(compartment = anno[ord], col = list(compartment = lineage_cols),
+                         show_annotation_name = FALSE)
+
+ht2 <- Heatmap(mat, name = hm_name, col = col_fun, top_annotation = top,
+        row_split = row_lin, column_split = anno[ord], column_title = NULL,
+        cluster_rows = FALSE, cluster_columns = FALSE, show_column_names = FALSE,
+        row_names_gp = gpar(fontsize = 7), row_title_gp = gpar(fontsize = 8), 
+        row_title_rot = 0,  
+        column_gap = unit(0.5,"mm"), row_gap = unit(0.5,"mm"), use_raster = TRUE)
+
+draw(ht2)
+```
+
+
+```{r}
+#Write cell type annotation to block mapping to same file
+celltype_block_map <- data.frame(
+  block = rownames(z),
+  assigned_celltype = block_anno[rownames(z)],
+  best_score = apply(z, 1, max),
+  second_score = apply(z, 1, function(x) sort(x, decreasing = TRUE)[2]),
+  score_margin = apply(z, 1, function(x) diff(sort(x, decreasing = TRUE)[1:2])),
+  top_module = apply(blockmeans[, rownames(z), drop = FALSE], 2, function(x) names(which.max(x))),
+  stringsAsFactors = FALSE
+)
+
+out_xlsx <- file.path(csv_dir, paste0(FILE_PREFIX, "_module_block_map.xlsx"))
+
+openxlsx::write.xlsx(
+  list(
+    modules_genes = modules_genes,
+    block_module_ranking = block_rank,
+    block_celltype_mapping = celltype_block_map
+  ),
+  file = out_xlsx,
+  rowNames = FALSE
+)
+```
+
+
+```{r}
+#Add block and cluster label info to seurat obj
+cdata_cell <- anndata::read_h5ad(CELLS_H5AD)
+counts_cell <- Matrix::t(cdata_cell$X)
+counts_cell <- as(counts_cell, "CsparseMatrix")   # dgRMatrix -> dgCMatrix
+
+colnames(counts_cell) <- rownames(cdata_cell$obs)
+rownames(counts_cell) <- rownames(cdata_cell$var)
+
+# X must be raw UMIs, not normalized
+stopifnot(inherits(counts_cell, "dgCMatrix"))
+stopifnot(nrow(counts_cell) == nrow(cdata_cell$var),
+          ncol(counts_cell) == nrow(cdata_cell$obs))
+stopifnot(all(counts_cell@x == floor(counts_cell@x)))
+
+pbmc <- CreateSeuratObject(counts = counts_cell, meta.data = as.data.frame(cdata_cell$obs))
+stopifnot(identical(colnames(pbmc), rownames(cdata_cell$obs)))
+
+# only name block if cutree did not already
+if (is.null(names(block))) {
+  stopifnot(length(block) == ncol(thmz))
+  names(block) <- colnames(thmz)
+} else {
+  stopifnot(setequal(names(block), colnames(thmz)))
+}
+
+mc_name    <- as.character(pbmc$metacell_name)
+mc_int     <- as.integer(as.character(pbmc$metacell))
+mc_outlier <- !is.na(mc_int) & mc_int < 0
+
+mc_block <- as.character(unname(block[mc_name]))
+mc_block[mc_outlier]  <- "Outlier"
+mc_block[is.na(mc_block)] <- "Unassigned"
+
+broad_label <- unname(block_anno[mc_block])
+broad_label[mc_block %in% c("Outlier", "Unassigned")] <- mc_block[mc_block %in% c("Outlier", "Unassigned")]
+broad_label[is.na(broad_label)] <- "Unassigned"
+
+blk_idx <- match(mc_block, as.character(celltype_block_map$block))
+
+pbmc <- AddMetaData(pbmc, data.frame(
+  mc_name         = mc_name,
+  mc_block        = mc_block,
+  mc_outlier      = mc_outlier,
+  broad_label     = broad_label,
+  mc_anno_score   = celltype_block_map$best_score[blk_idx],
+  mc_anno_margin  = celltype_block_map$score_margin[blk_idx],
+  mc_top_module   = celltype_block_map$top_module[blk_idx],
+  row.names       = colnames(pbmc),
+  stringsAsFactors = FALSE
+))
+
+mc_lookup <- data.frame(
+  metacell_name = names(block),
+  mc_block      = unname(block),
+  broad_label   = unname(block_anno[as.character(unname(block))]),
+  stringsAsFactors = FALSE
+)
+write.csv(mc_lookup, file.path(csv_dir, paste0(FILE_PREFIX, "_metacell_block_annotations.csv")), row.names = FALSE)
+
+cat("Metacells in module heatmap (thmz):     ", length(block), "\n")
+cat("Metacells assigned to >=1 cell:         ", length(unique(mc_name[!mc_outlier])), "\n")
+cat("Assigned, block-labelled metacells:     ", length(unique(mc_name[!mc_outlier & !mc_block %in% c("Outlier","Unassigned")])), "\n")
+cat("Cells total:                            ", ncol(pbmc), "\n")
+cat("  in metacell:                          ", sum(!mc_outlier), "\n")
+cat("  MC2 outliers:                         ", sum(broad_label == "Outlier"), "\n")
+cat("  Unassigned (MC not in heatmap):       ", sum(broad_label == "Unassigned"), "\n")
+cat("  Undefined (weak score):               ", sum(broad_label == "Undefined"), "\n")
+print(table(broad_label, useNA = "ifany"))
+```
+
+```{r}
+saveRDS(pbmc, file.path(rds_dir, paste0(FILE_PREFIX, "_MC_annotated.RDS")))
+```
+
+
+<!-- Optional. Rerun every chunk below after relabelling blocks, so the
+     workbooks and the annotated RDS pick up the new calls. -->
+
+
+# regenerate the annotation heatmap after relabelling in 04
+
+```{r}
+# Optional: apply hand curation from 04 and redraw. Requires the annotation heatmap chunk to have run.
+# Writes block_anno_final; block_anno is left as the automatic call so it is never silently overwritten.
+# Keep in sync with BLOCK_RELABEL in 04.
+# 7 -> T cells: M28/M23 naive-CM CD4 program, scores ~0 from CD3 dropout in resting cells
+# 5 -> Granulocytes: M5 neutrophil (CD177, ALPL, CYP4F3, ADGRG3), no neutrophil genes in the mast-only sig
+# 1 -> MK/Ery: M24 MK (P2RY12, RGS18, NFE2, MEIS1) + M32/M27 ery (HEMGN, CA2, RHAG), mast trio not specific vs MK
+BLOCK_RELABEL <- c()   # e.g. c("7" = "T cells", "5" = "Granulocytes")
+
+stopifnot(exists("block_anno"), all(names(BLOCK_RELABEL) %in% names(block_anno)))
+block_anno_final <- block_anno
+block_anno_final[names(BLOCK_RELABEL)] <- BLOCK_RELABEL
+
+cat("blocks relabelled:", sum(block_anno_final != block_anno), "\n")
+print(data.frame(block = names(BLOCK_RELABEL),
+                 auto  = block_anno[names(BLOCK_RELABEL)],
+                 final = block_anno_final[names(BLOCK_RELABEL)], row.names = NULL))
+
+# any label introduced by the relabel that the panel does not define, kept before Undefined
+new_lin   <- setdiff(unique(block_anno_final), lin_order)
+lin_order <- c(names(panel), new_lin, "Undefined")
+
+anno <- factor(block_anno_final[as.character(block)], levels = lin_order)
+ord  <- order(anno, block); ord <- ord[!is.na(anno[ord])]
+anno <- droplevels(anno)   # drops Undefined if nothing is left in it
+
+if (scale_rows) {
+  mat <- t(scale(t(lognorm[markers, ord]))); mat[mat > 2.5] <- 2.5; mat[mat < -2.5] <- -2.5
+} else {
+  mat <- lognorm[markers, ord]
+}
+
+# keyed by name so new compartments cannot shift the existing colors
+lineage_cols <- c(
+  "T cells"      = "#8B1A1A",
+  "NK"           = "#4E9E2F",
+  "B cells"      = "#2C6FAD",
+  "Plasma cells" = "#E69F00",
+  "Granulocytes" = "#2D6A4F",
+  "Mo/Macs"      = "#9E79C4",
+  "moDCs"        = "#56B4E9",
+  "pDCs"         = "#A0522D",
+  "Platelet"     = "#CC79A7",
+  "Cycling"      = "#8C8C8C",
+  "MK/Ery"       = "#7F3F98",
+  "Undefined"    = "#B2182B"
+)
+stopifnot(!anyNA(names(lineage_cols)), all(lin_order %in% names(lineage_cols)))
+lineage_cols <- lineage_cols[lin_order]
+
+top <- HeatmapAnnotation(compartment = anno[ord], col = list(compartment = lineage_cols),
+                         show_annotation_name = FALSE)
+ht2c <- Heatmap(mat, name = hm_name, col = col_fun, top_annotation = top,
+        row_split = row_lin, column_split = anno[ord], column_title = NULL,
+        cluster_rows = FALSE, cluster_columns = FALSE, show_column_names = FALSE,
+        row_names_gp = gpar(fontsize = 7), row_title_gp = gpar(fontsize = 8),
+        row_title_rot = 0,
+        column_gap = unit(0.5,"mm"), row_gap = unit(0.5,"mm"), use_raster = TRUE)
+draw(ht2c)
+```
+
+```{r}
+#Write cell type annotation to block mapping to same file
+# uses the curated labels if the optional relabel chunk ran, automatic otherwise
+block_anno_use <- if (exists("block_anno_final")) block_anno_final else block_anno
+label_source   <- if (exists("block_anno_final")) "curated" else "automatic"
+cat("block labels in use:", label_source, "\n")
+
+celltype_block_map <- data.frame(
+  block = rownames(z),
+  assigned_celltype = block_anno_use[rownames(z)],
+  best_score = apply(z, 1, max),
+  second_score = apply(z, 1, function(x) sort(x, decreasing = TRUE)[2]),
+  score_margin = apply(z, 1, function(x) diff(sort(x, decreasing = TRUE)[1:2])),
+  top_module = apply(blockmeans[, rownames(z), drop = FALSE], 2, function(x) names(which.max(x))),
+  label_source = label_source,
+  stringsAsFactors = FALSE
+)
+
+out_xlsx <- file.path(csv_dir, paste0(FILE_PREFIX, "_module_block_map.xlsx"))
+
+openxlsx::write.xlsx(
+  list(
+    modules_genes = modules_genes,
+    block_module_ranking = block_rank,
+    block_celltype_mapping = celltype_block_map
+  ),
+  file = out_xlsx,
+  rowNames = FALSE
+)
+```
+
+```{r}
+#Add block and cluster label info to seurat obj
+# uses the curated labels if the optional relabel chunk ran, automatic otherwise
+block_anno_use <- if (exists("block_anno_final")) block_anno_final else block_anno
+label_source   <- if (exists("block_anno_final")) "curated" else "automatic"
+cat("block labels in use:", label_source, "\n")
+stopifnot(identical(celltype_block_map$label_source[1], label_source))
+
+cdata_cell <- anndata::read_h5ad(CELLS_H5AD)
+counts_cell <- Matrix::t(cdata_cell$X)
+counts_cell <- as(counts_cell, "CsparseMatrix")   # dgRMatrix -> dgCMatrix
+colnames(counts_cell) <- rownames(cdata_cell$obs)
+rownames(counts_cell) <- rownames(cdata_cell$var)
+
+# X must be raw UMIs, not normalized
+stopifnot(inherits(counts_cell, "dgCMatrix"))
+stopifnot(nrow(counts_cell) == nrow(cdata_cell$var),
+          ncol(counts_cell) == nrow(cdata_cell$obs))
+stopifnot(all(counts_cell@x == floor(counts_cell@x)))
+
+pbmc <- CreateSeuratObject(counts = counts_cell, meta.data = as.data.frame(cdata_cell$obs))
+stopifnot(identical(colnames(pbmc), rownames(cdata_cell$obs)))
+
+# only name block if cutree did not already
+if (is.null(names(block))) {
+  stopifnot(length(block) == ncol(thmz))
+  names(block) <- colnames(thmz)
+} else {
+  stopifnot(setequal(names(block), colnames(thmz)))
+}
+
+mc_name    <- as.character(pbmc$metacell_name)
+mc_int     <- as.integer(as.character(pbmc$metacell))
+mc_outlier <- !is.na(mc_int) & mc_int < 0
+
+mc_block <- as.character(unname(block[mc_name]))
+mc_block[mc_outlier]  <- "Outlier"
+mc_block[is.na(mc_block)] <- "Unassigned"
+
+broad_label <- unname(block_anno_use[mc_block])
+broad_label[mc_block %in% c("Outlier", "Unassigned")] <- mc_block[mc_block %in% c("Outlier", "Unassigned")]
+broad_label[is.na(broad_label)] <- "Unassigned"
+
+blk_idx <- match(mc_block, as.character(celltype_block_map$block))
+
+pbmc <- AddMetaData(pbmc, data.frame(
+  mc_name         = mc_name,
+  mc_block        = mc_block,
+  mc_outlier      = mc_outlier,
+  broad_label     = broad_label,
+  label_source    = label_source,
+  mc_anno_score   = celltype_block_map$best_score[blk_idx],
+  mc_anno_margin  = celltype_block_map$score_margin[blk_idx],
+  mc_top_module   = celltype_block_map$top_module[blk_idx],
+  row.names       = colnames(pbmc),
+  stringsAsFactors = FALSE
+))
+
+mc_lookup <- data.frame(
+  metacell_name = names(block),
+  mc_block      = unname(block),
+  broad_label   = unname(block_anno_use[as.character(unname(block))]),
+  label_source  = label_source,
+  stringsAsFactors = FALSE
+)
+write.csv(mc_lookup, file.path(csv_dir, paste0(FILE_PREFIX, "_metacell_block_annotations.csv")), row.names = FALSE)
+
+cat("Metacells in module heatmap (thmz):     ", length(block), "\n")
+cat("Metacells assigned to >=1 cell:         ", length(unique(mc_name[!mc_outlier])), "\n")
+cat("Assigned, block-labelled metacells:     ", length(unique(mc_name[!mc_outlier & !mc_block %in% c("Outlier","Unassigned")])), "\n")
+cat("Cells total:                            ", ncol(pbmc), "\n")
+cat("  in metacell:                          ", sum(!mc_outlier), "\n")
+cat("  MC2 outliers:                         ", sum(broad_label == "Outlier"), "\n")
+cat("  Unassigned (MC not in heatmap):       ", sum(broad_label == "Unassigned"), "\n")
+cat("  Undefined (weak score):               ", sum(broad_label == "Undefined"), "\n")
+print(table(broad_label, useNA = "ifany"))
+```
+
+
+```{r}
+saveRDS(pbmc, file.path(rds_dir, paste0(FILE_PREFIX, "_MC_annotated.RDS")))
+```
+
+
+<!-- # Block-wise dot plot, all modules  -->
+
+<!-- ```{r} -->
+<!-- library(reshape2); library(ggplot2) -->
+<!-- drivers <- unique(as.vector(apply(blockmeans, 2, function(c) names(sort(c, decreasing=TRUE))[1:5]))) -->
+<!-- mean_z <- t(sapply(drivers, function(m) tapply(thmz[m,], block, mean))) -->
+<!-- frac_on <- t(sapply(drivers, function(m) tapply(thmz[m,] > 0, block, mean))) -->
+<!-- df <- melt(mean_z, value.name="meanz"); df$frac <- melt(frac_on)$value -->
+<!-- df$Var2 <- factor(df$Var2) -->
+<!-- ggplot(df, aes(Var2, Var1, size=frac, color=meanz)) +  -->
+<!--   geom_point() +  -->
+<!--   scale_color_gradient2(low="navy", mid="white", high="firebrick") +  -->
+<!--   labs(x="metacell block", y="module") +  -->
+<!--   theme_bw() +  -->
+<!--   theme(axis.text.x=element_text(angle=90, vjust=0.5, size=6), axis.text.y=element_text(size=5)) -->
+<!-- ``` -->
+
+
+<!-- # Modules grouped together based on block heatmap -->
+
+<!-- ```{r} -->
+<!-- # 1. assign each module to the single block where its mean z is highest -->
+<!-- mod_block <- apply(blockmeans, 1, function(r) which.max(r))   # module -> its dominant block -->
+<!-- # 2. one row per block = mean z across that block's modules, evaluated over ALL metacells -->
+<!-- grp_rows <- t(sapply(sort(unique(mod_block)), function(b){ -->
+<!--   mods <- names(mod_block)[mod_block == b] -->
+<!--   if (length(mods) == 1) thmz[mods, ] else colMeans(thmz[mods, , drop=FALSE]) -->
+<!-- })) -->
+<!-- rownames(grp_rows) <- paste0("blk", sort(unique(mod_block)), "_mods") -->
+<!-- # 3. plot: module-group rows x all metacells, columns split by block -->
+<!-- ord <- order(block) -->
+<!-- anno <- factor(block_anno[as.character(block)], levels = lin_order) -->
+<!-- ord <- order(anno, block) -->
+<!-- grp_rows <- t(scale(t(grp_rows))) -->
+<!-- grp_rows[grp_rows > 2.5] <- 2.5 -->
+<!-- grp_rows[grp_rows < -2.5] <- -2.5 -->
+
+<!-- ComplexHeatmap::Heatmap(grp_rows[, ord], cluster_columns=FALSE, cluster_rows=FALSE, -->
+<!--                         show_column_names=FALSE, column_split=block[ord], -->
+<!--                         col=circlize::colorRamp2(c(-2,0,2), c("#3B4CC0","#F7F7F7","#B40426")), name="mean z", -->
+<!--                         row_names_gp=grid::gpar(fontsize=6), column_title_gp=grid::gpar(fontsize=5), -->
+<!--                         column_gap=grid::unit(0.3,"mm")) -->
+<!-- ``` -->
+
+
+<!-- # UMAP of metacells from Jupyter metacell coordinates - UMAP based on find_marker_genes and has nothing to do with module gene sets -->
+
+```{r}
+# umap <- read.csv(file.path(csv_dir, paste0(FILE_PREFIX, "_metacell_umap_coords.csv")), row.names=1)
+# umap$block <- factor(block[rownames(umap)])
+# cent <- aggregate(cbind(x, y) ~ block, data = umap, FUN = median)
+# ggplot(umap, aes(x, y, color = block)) +
+#   geom_point(size = 1.2) +
+#   geom_text_repel(data = cent, aes(label = block), color = "black", size = 4, seed = 42, box.padding = 0.3, max.overlaps = Inf) +
+#   theme_void() + theme(legend.position = "none")
+# 
+# ## SCpubr UMAP
+# umap <- read.csv(file.path(csv_dir, paste0(FILE_PREFIX, "_metacell_umap_coords.csv")), row.names=1)
+# total <- CreateSeuratObject(dgcmtxcounts)
+# umap <- umap[colnames(total), ]                      
+# total$block <- factor(block[colnames(total)])        
+# emb <- as.matrix(umap[, c("x","y")]); colnames(emb) <- c("mcUMAP_1","mcUMAP_2")
+# total[["mcumap"]] <- CreateDimReducObject(embeddings = emb, key = "mcUMAP_", assay = DefaultAssay(total))
+# do_DimPlot(total, 
+#            reduction = "mcumap", 
+#            group.by = "block", 
+#            label = TRUE, 
+#            repel = TRUE, 
+#            legend.position = "right")
+#SCpubr with metacell celltype annotations
+#block_labels <- c("1"="Baso?", "24"="CD4 Tem", "25"="CD8 eff")   # manual calls
+#total$celltype <- factor(block_labels[as.character(total$block)])
+#do_DimPlot(total, reduction = "mcumap", group.by = "celltype", label = TRUE, repel = TRUE)
+```
+
+
+# Stacked bar plot, cell level
+
+Quick look only. The reportable version, with donor weighting and the
+`complete()` zero-fill, is step 06. See docs/09_composition.md.
+
+```{r}
+library(dplyr)
+# ---- 1. per-cell metadata + metacell assignment ----
+cdata <- read_h5ad(CELLS_H5AD)
+cell  <- cdata$obs
+print(colnames(cell))
+
+cell <- cell[cell$metacell >= 0, ]
+cell$mc_name <- as.character(cell$metacell_name)   # now every row maps to a real metacell
+
+# ---- 2. attach block annotation (block_anno + block from the heatmap step) ----
+names(block) <- colnames(thmz)
+cell$block      <- block[cell$mc_name]
+cell$broad_label <- block_anno[as.character(cell$block)]
+cell <- cell[!is.na(cell$broad_label), ]
+
+# ---- 3. % per label within each sample, then averaged per group ----
+per_sample <- cell %>%
+  dplyr::count(sample_origin, broad_label) %>%
+  group_by(sample_origin) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+
+sample_map <- cell %>% dplyr::select(sample_origin, condition, category, category_plot) %>% distinct()
+per_sample <- per_sample %>% left_join(sample_map, by = "sample_origin")
+
+summary_avg <- per_sample %>%
+  group_by(category_plot, broad_label) %>%
+  summarise(mean_pct = mean(pct), .groups = "drop")
+
+# ---- 4. plot, palette keyed by label name ----
+labs_all <- sort(unique(summary_avg$broad_label))
+colour_palette <- setNames(
+  c("#2C6FAD", "#5DC8C8", "#8B7420", "#E3B505", "#4E9E2F", "#ADD8E6", "#9E79C4","#8B1A1A","#8C8C8C")[seq_along(labs_all)],
+  labs_all)
+
+ggplot(summary_avg, aes(category_plot, mean_pct, fill = broad_label)) +
+  geom_col(position = "fill") +
+  scale_fill_manual(values = colour_palette) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(y = "% of total cells", x = NULL, fill = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid.major.x = element_blank())
+```

@@ -1,0 +1,525 @@
+---
+title: "12 External label mapping"
+author: "Saumya Pothukuchi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+---
+
+# Libraries
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(ComplexHeatmap)
+library(circlize)
+library(writexl)
+```
+
+# Configuration
+
+```{r, results = FALSE, message = FALSE, warning = FALSE}
+# Paths and factor levels come from config/config.R, as in every other step.
+source(file.path("..", "config", "config.R"))
+
+SUBSET_SLUG <- "subset"
+FILE_PREFIX <- "subset_data"
+
+csv_dir <- out_dirs(SUBSET_SLUG, "csv")
+fig_dir <- out_dirs(SUBSET_SLUG, "pdf")
+
+# the object carrying the external per-cell calls to be transferred in
+extcalls_path <- file.path(DIR_RDS, SUBSET_SLUG, "extcalls_obj.rds")
+# the annotated objects written by 05 and 03
+metacell_path <- file.path(DIR_RDS, SUBSET_SLUG, "metacell",
+                           paste0(FILE_PREFIX, "_MC_annotated.RDS"))
+global_path   <- file.path(DIR_RDS, "global", "metacell", "global_MC_annotated.RDS")
+```
+
+# Load files and map
+
+Barcodes are reformatted before the join: the external object uses
+`SAMPLE_BARCODE`, step 01 wrote `BARCODE_SAMPLE`. A sample losing every barcode
+after the join means the reformat is wrong, not that the transfer failed.
+
+```{r}
+
+extcalls_data <- readRDS(extcalls_path)
+subset_data   <- readRDS(metacell_path)
+
+# Columns to transfer from extcalls output
+cols_to_transfer <- c(
+  "flag_pos", "flag_call", "scGate_multi",
+  "is.pure_A", "is.pure_B",
+  "Tcell_UCell", "CD4Tcell_UCell", "CD8T_UCell",
+  "Talphabeta_UCell", "Tgammadelta_UCell",
+  "Tgd1_UCell", "Tgd2_UCell", "Treg_UCell",
+  "scDblFinder_class", "scDblFinder_score",
+  "KEEP_CELL"
+)
+
+# Filter for present columns
+cols_present <- intersect(cols_to_transfer, colnames(extcalls_data@meta.data))
+extcalls_meta <- extcalls_data@meta.data[, cols_present, drop = FALSE]
+
+# Avoid overwriting existing QC columns
+if ("scDblFinder_class" %in% colnames(extcalls_meta)) {
+  colnames(extcalls_meta)[colnames(extcalls_meta) == "scDblFinder_class"] <- "extcalls_scDblFinder_class"
+}
+if ("scDblFinder_score" %in% colnames(extcalls_meta)) {
+  colnames(extcalls_meta)[colnames(extcalls_meta) == "scDblFinder_score"] <- "extcalls_scDblFinder_score"
+}
+
+# 1. Reformat extcalls barcodes from 'SAMPLE_BARCODE' to 'BARCODE_SAMPLE'
+rownames(extcalls_meta) <- sub("^(.*?)_(.*)$", "\\2_\\1", rownames(extcalls_meta))
+
+as_flag_logical <- function(x) {
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) x <- x %in% c("TRUE", "True", "true", "1")
+  x <- as.logical(x); x[is.na(x)] <- FALSE; x
+}
+extcalls_meta$flag_pos <- as_flag_logical(extcalls_meta$flag_pos)
+
+# ---- flag accounting, before any transfer -------------------------------------
+n_cert     <- nrow(extcalls_meta)
+flag_bc     <- rownames(extcalls_meta)[extcalls_meta$flag_pos]
+n_flag_ext <- length(flag_bc)
+cat(sprintf("Extcalls cells:                 %d\n", n_cert))
+cat(sprintf("Flag+ in extcalls:               %d (%.2f%% of extcalls)\n",
+            n_flag_ext, 100 * n_flag_ext / n_cert))
+
+
+if (file.exists(global_path)) {
+  global_md <- readRDS(global_path)@meta.data
+  in_glob   <- intersect(flag_bc, rownames(global_md))
+  cat(sprintf("Flag+ found in global MC object:  %d (%.2f%% of Flag+)\n",
+              length(in_glob), 100 * length(in_glob) / n_flag_ext))
+  flag_broad <- as.data.frame(table(broad_label = global_md[in_glob, "broad_label"]),
+                             responseName = "n_flag") %>%
+    filter(n_flag > 0) %>%
+    mutate(pct_of_car = round(100 * n_flag / sum(n_flag), 2)) %>%
+    arrange(desc(n_flag))
+  cat("\nFlag+ cells by global broad_label:\n"); print(flag_broad)
+  rm(global_md); invisible(gc())
+} else {
+  warning("global MC object not found, broad_label breakdown skipped: ", global_path)
+}
+
+# ---- transfer ----------------------------------------------------------------
+shared_barcodes <- intersect(rownames(extcalls_meta), colnames(subset_data))
+cat(sprintf("\nBarcode transfer: %d of %d subset cells matched (%.2f%%)\n",
+            length(shared_barcodes), ncol(subset_data),
+            100 * length(shared_barcodes) / ncol(subset_data)))
+
+# 3. Add metadata to subset_data
+subset_data <- AddMetaData(subset_data, metadata = extcalls_meta[shared_barcodes, , drop = FALSE])
+subset_data$flag_pos <- as_flag_logical(subset_data$flag_pos)
+stopifnot(is.logical(subset_data$flag_pos), !anyNA(subset_data$flag_pos))
+
+# ---- flag accounting inside the subset --------------------------------------
+n_flag_sub <- sum(subset_data$flag_pos)
+cat(sprintf("\nFlag+ landing in subset:        %d (%.2f%% of all Flag+, %.2f%% of T cells)\n",
+            n_flag_sub, 100 * n_flag_sub / n_flag_ext, 100 * n_flag_sub / ncol(subset_data)))
+cat(sprintf("Flag+ lost outside subset:      %d\n", n_flag_ext - n_flag_sub))
+
+annotation_col <- "cluster_label"
+stopifnot(annotation_col %in% colnames(subset_data@meta.data))
+
+drop_labels <- c("Outlier", "Unassigned", "Undefined")
+flag_by_label <- subset_data@meta.data %>%
+  group_by(cluster_label) %>%
+  summarise(n_cells = n(), n_flag = sum(flag_pos),
+            pct_flag_of_label = round(100 * mean(flag_pos), 2), .groups = "drop") %>%
+  mutate(pct_of_flag_in_T = round(100 * n_flag / sum(n_flag), 2)) %>%
+  arrange(desc(n_flag))
+cat("\nFlag+ cells by cluster_label:\n"); print(as.data.frame(flag_by_label))
+
+n_flag_dropped <- sum(flag_by_label$n_flag[flag_by_label$cluster_label %in% drop_labels])
+cat(sprintf("\nFlag+ in dropped labels (%s): %d (%.2f%% of Flag+ in subset)\n",
+            paste(drop_labels, collapse = "/"), n_flag_dropped,
+            100 * n_flag_dropped / max(n_flag_sub, 1)))
+cat(sprintf("Flag+ retained for plotting:      %d\n", n_flag_sub - n_flag_dropped))
+```
+
+
+```{r}
+ ## OPŁIONAL -- MAPPING FOR CLONAL TCR OBJ
+
+# Define input paths
+# same object as above, reloaded here so this chunk runs standalone
+
+extcalls_data <- readRDS(extcalls_path)
+
+# Columns to transfer from extcalls output
+cols_to_transfer <- c(
+  "flag_pos", "flag_call", "scGate_multi",
+  "is.pure_A", "is.pure_B",
+  "Tcell_UCell", "CD4Tcell_UCell", "CD8T_UCell",
+  "Talphabeta_UCell", "Tgammadelta_UCell",
+  "Tgd1_UCell", "Tgd2_UCell", "Treg_UCell",
+  "scDblFinder_class", "scDblFinder_score",
+  "KEEP_CELL"
+)
+
+# Filter for present columns
+cols_present <- intersect(cols_to_transfer, colnames(extcalls_data@meta.data))
+extcalls_meta <- extcalls_data@meta.data[, cols_present, drop = FALSE]
+
+# Avoid overwriting existing QC columns
+if ("scDblFinder_class" %in% colnames(extcalls_meta)) {
+  colnames(extcalls_meta)[colnames(extcalls_meta) == "scDblFinder_class"] <- "extcalls_scDblFinder_class"
+}
+if ("scDblFinder_score" %in% colnames(extcalls_meta)) {
+  colnames(extcalls_meta)[colnames(extcalls_meta) == "scDblFinder_score"] <- "extcalls_scDblFinder_score"
+}
+
+# 1. Reformat extcalls barcodes from 'SAMPLE_BARCODE' to 'BARCODE_SAMPLE'
+rownames(extcalls_meta) <- sub("^(.*?)_(.*)$", "\\2_\\1", rownames(extcalls_meta))
+
+as_flag_logical <- function(x) {
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) x <- x %in% c("TRUE", "True", "true", "1")
+  x <- as.logical(x); x[is.na(x)] <- FALSE; x
+}
+extcalls_meta$flag_pos <- as_flag_logical(extcalls_meta$flag_pos)
+
+# ---- flag accounting, before any transfer -------------------------------------
+n_cert     <- nrow(extcalls_meta)
+flag_bc     <- rownames(extcalls_meta)[extcalls_meta$flag_pos]
+n_flag_ext <- length(flag_bc)
+cat(sprintf("Extcalls cells:                 %d\n", n_cert))
+cat(sprintf("Flag+ in extcalls:               %d (%.2f%% of extcalls)\n",
+            n_flag_ext, 100 * n_flag_ext / n_cert))
+
+
+if (file.exists(global_path)) {
+  global_md <- readRDS(global_path)@meta.data
+  in_glob   <- intersect(flag_bc, rownames(global_md))
+  cat(sprintf("Flag+ found in global MC object:  %d (%.2f%% of Flag+)\n",
+              length(in_glob), 100 * length(in_glob) / n_flag_ext))
+  flag_broad <- as.data.frame(table(broad_label = global_md[in_glob, "broad_label"]),
+                             responseName = "n_flag") %>%
+    filter(n_flag > 0) %>%
+    mutate(pct_of_car = round(100 * n_flag / sum(n_flag), 2)) %>%
+    arrange(desc(n_flag))
+  cat("\nFlag+ cells by global broad_label:\n"); print(flag_broad)
+  rm(global_md); invisible(gc())
+} else {
+  warning("global MC object not found, broad_label breakdown skipped: ", global_path)
+}
+
+# ---- transfer ----------------------------------------------------------------
+shared_barcodes <- intersect(rownames(extcalls_meta), colnames(obj))
+cat(sprintf("\nBarcode transfer: %d of %d subset cells matched (%.2f%%)\n",
+            length(shared_barcodes), ncol(obj),
+            100 * length(shared_barcodes) / ncol(obj)))
+
+# 3. Add metadata to subset_data
+obj <- AddMetaData(obj, metadata = extcalls_meta[shared_barcodes, , drop = FALSE])
+obj$flag_pos <- as_flag_logical(obj$flag_pos)
+stopifnot(is.logical(obj$flag_pos), !anyNA(obj$flag_pos))
+
+# ---- flag accounting inside the subset --------------------------------------
+n_flag_sub <- sum(obj$flag_pos)
+cat(sprintf("\nFlag+ landing in subset:        %d (%.2f%% of all Flag+, %.2f%% of T cells)\n",
+            n_flag_sub, 100 * n_flag_sub / n_flag_ext, 100 * n_flag_sub / ncol(obj)))
+cat(sprintf("Flag+ lost outside subset:      %d\n", n_flag_ext - n_flag_sub))
+
+annotation_col <- "cluster_label"
+stopifnot(annotation_col %in% colnames(obj@meta.data))
+
+drop_labels <- c("Outlier", "Unassigned", "Undefined")
+flag_by_label <- obj@meta.data %>%
+  group_by(cluster_label) %>%
+  summarise(n_cells = n(), n_flag = sum(flag_pos),
+            pct_flag_of_label = round(100 * mean(flag_pos), 2), .groups = "drop") %>%
+  mutate(pct_of_flag_in_T = round(100 * n_flag / sum(n_flag), 2)) %>%
+  arrange(desc(n_flag))
+cat("\nFlag+ cells by cluster_label:\n"); print(as.data.frame(flag_by_label))
+
+n_flag_dropped <- sum(flag_by_label$n_flag[flag_by_label$cluster_label %in% drop_labels])
+cat(sprintf("\nFlag+ in dropped labels (%s): %d (%.2f%% of Flag+ in subset)\n",
+            paste(drop_labels, collapse = "/"), n_flag_dropped,
+            100 * n_flag_dropped / max(n_flag_sub, 1)))
+cat(sprintf("Flag+ retained for plotting:      %d\n", n_flag_sub - n_flag_dropped))
+```
+
+## Flag figures
+
+```{r}
+# One palette, keyed on cluster_label itself. Nothing is matched or derived at plot
+# time: a cell is referred to by its final label and only that.
+cluster_cols <- c(
+  "CD4 Naive/Tcm"             = "#2C6FAD",
+  "CD8 Tem/GZMK"              = "#4E9E2F",
+  "CD8 Temra/Cytotox"         = "#8B1A1A",
+  "CD4 Treg"                  = "#E69F00",
+  "CD4 MAIT"                  = "#2D6A4F",
+  "CD8 Innate-like"           = "#A0522D",
+  "CD4/CD8-amb Innate-like"   = "#C98A63",
+  "CD8 Cycling"               = "#9E79C4",
+  "CD8 Exhausted/Act"         = "#CC79A7",
+  "CD4/CD8-amb Exhausted/Act" = "#E3AEC8"
+)
+
+labs_keep <- setdiff(sort(unique(as.character(subset_data$cluster_label))), drop_labels)
+stopifnot(all(labs_keep %in% names(cluster_cols)))
+labs_keep <- names(cluster_cols)[names(cluster_cols) %in% labs_keep]
+
+cp_levels <- levels(subset_data$category_plot)
+md <- subset_data@meta.data %>%
+  filter(cluster_label %in% labs_keep) %>%
+  mutate(cluster_label = factor(as.character(cluster_label), levels = labs_keep),
+         category_plot = factor(as.character(category_plot), levels = cp_levels),
+         condition     = factor(as.character(condition), levels = c("CTRL", "CASE")))
+
+# ── Plot 1: Flag+ cells per cluster ────────────────────────────────────────────
+cluster_df <- md %>%
+  group_by(cluster_label, .drop = FALSE) %>%
+  summarise(car_pos = sum(flag_pos), .groups = "drop") %>%
+  filter(car_pos > 0)
+
+p1 <- ggplot(cluster_df, aes(x = "", y = car_pos, fill = cluster_label)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = car_pos), position = position_stack(vjust = 0.5),
+            size = 3, fontface = "bold", color = "white") +
+  scale_fill_manual(values = cluster_cols, drop = FALSE) +
+  labs(title = "Flag+ cells per cluster", fill = "cluster_label", x = NULL, y = NULL) +
+  theme_void() +
+  theme(plot.title = element_text(size = 12, face = "bold", hjust = 0.5))
+
+# ── Plot 3: total Flag+ per sample, and CD4/CD8 proportion below ───────────────
+cd_cell <- md %>%
+  mutate(sublineage_label = factor(dplyr::case_when(
+    is.pure_B == "Pure" & is.pure_A != "Pure" ~ "CD8",
+    is.pure_A == "Pure" & is.pure_B != "Pure" ~ "CD4",
+    is.pure_B == "Pure" & is.pure_A == "Pure" ~ "Multi",
+    TRUE ~ "Unassigned"), levels = c("CD8", "CD4", "Multi", "Unassigned"))) %>%
+  filter(flag_pos)
+
+samp_map <- md %>% distinct(category_plot, condition)
+
+cd_counts <- cd_cell %>%
+  dplyr::count(category_plot, sublineage_label, name = "car_count", .drop = FALSE) %>%
+  left_join(samp_map, by = "category_plot")
+
+tot_df <- cd_counts %>%
+  group_by(category_plot, condition) %>%
+  summarise(total = sum(car_count), .groups = "drop")
+
+prop_df <- cd_counts %>%
+  group_by(category_plot) %>%
+  mutate(tot = sum(car_count),
+         pct = ifelse(tot > 0, 100 * car_count / tot, 0)) %>%
+  ungroup()
+
+cd_cols  <- c("CD8" = "#B5563C", "CD4" = "#2E5F82",
+              "Multi" = "#D9C05A", "Unassigned" = "#C9C6C0")
+cond_cols <- c("CTRL" = "#F5C342", "CASE" = "#D4494E")
+
+# ── Plot 3: total Flag+ per sample, and CD4/CD8 proportion below ───────────────
+pA <- ggplot(tot_df, aes(category_plot, total, fill = condition)) +
+  geom_col(width = 1, color = "black", linewidth = 0.2) +
+  geom_text(aes(label = total), vjust = -0.4, size = 2.8, fontface = "bold") +
+  facet_grid(~ condition, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = cond_cols, guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+  labs(y = "Total Flag+ cells", x = NULL,
+       title = "Flag+ T cells: total and CD4 vs CD8 breakdown per sample") +
+  theme_classic() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        strip.text = element_text(face = "bold", size = 9),
+        plot.title = element_text(size = 11, face = "bold"))
+
+pB <- ggplot(prop_df, aes(category_plot, pct, fill = sublineage_label)) +
+  geom_col(position = "stack", width = 1, color = "black", linewidth = 0.2) +
+  facet_grid(~ condition, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = cd_cols) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  labs(y = "Proportion (%)", x = NULL, fill = "T cell type") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        strip.text = element_blank(), strip.background = element_blank(),
+        legend.position = "bottom")
+
+p3 <- patchwork::wrap_plots(pA, pB, ncol = 1, heights = c(1, 1.4))
+
+p1
+p3
+```
+
+## Heatmaps
+
+```{r}
+# subset_bkp <- subset_data
+# subset_data <- JoinLayers(subset_data)
+# if (!"data" %in% Layers(subset_data[["RNA"]]) ||
+#     identical(GetAssayData(subset_data, layer = "data"),
+#               GetAssayData(subset_data, layer = "counts"))) {
+#   subset_data <- NormalizeData(subset_data, verbose = FALSE)
+# }
+
+SIGS <- list(
+  "Cytotoxic"  = c("GZMA","GZMB","GZMH","GZMK","PRF1","GNLY","NKG7","CTSW","KLRD1"),
+  "IFN"        = c("IFNG","ISG15","IFI6","IFI44L","MX1","OAS1","IFIT1","IFIT3","STAT1"),
+  "Homing"     = c("SELL","CCR7","S1PR1","KLF2","CXCR4","SELPLG","ITGAL","ITGB7","ITGA4"),
+  "Exhaustion" = c("PDCD1","CTLA4","LAG3","HAVCR2","TIGIT","TOX","ENTPD1","BATF","IRF4")
+)
+
+GRP_DEF <- list("CTRL_Flag-" = c("CTRL", FALSE), "CTRL_Flag+" = c("CTRL", TRUE),
+                "CASE_Flag-"   = c("CASE",   FALSE), "CASE_Flag+"   = c("CASE",   TRUE))
+
+col_scale <- colorRamp2(c(-2, 0, 2), c("#005B7F", "white", "#D4494E"))
+
+sig_heatmap <- function(obj, genes, title) {
+  genes <- intersect(genes, rownames(obj))
+  expr  <- GetAssayData(obj, layer = "data")[genes, , drop = FALSE]
+  meta  <- obj@meta.data
+  mat <- sapply(GRP_DEF, function(g) {
+    i <- which(as.character(meta$condition) == g[1] & meta$flag_pos == as.logical(g[2]))
+    if (!length(i)) rep(NA_real_, length(genes)) else Matrix::rowMeans(expr[, i, drop = FALSE])
+  })
+  mat <- t(scale(t(mat)))          # each row z-scored within its own signature
+  mat[is.na(mat)] <- 0
+
+  col_ha <- HeatmapAnnotation(
+    Condition = sub("_.*$", "", names(GRP_DEF)),
+    flag       = sub("^.*_", "", names(GRP_DEF)),
+    col = list(Condition = c("CTRL" = "#F5C342", "CASE" = "#D4494E"),
+               flag       = c("Flag-" = "#82B446", "Flag+" = "#7846B4")),
+    annotation_name_gp = gpar(fontsize = 7))
+
+  Heatmap(mat, name = title, col = col_scale,
+          top_annotation = col_ha,
+          cluster_rows = FALSE, cluster_columns = FALSE,
+          row_names_side = "left",
+          heatmap_legend_param = list(title = "z-score", direction = "horizontal"),
+          column_title = title, column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+          row_names_gp = gpar(fontsize = 8), column_names_gp = gpar(fontsize = 8),
+          width = unit(2.2, "cm"))
+}
+
+h1 <- sig_heatmap(subset_data, SIGS$Cytotoxic,  "Cytotoxic")
+h2 <- sig_heatmap(subset_data, SIGS$IFN,        "IFN")
+h3 <- sig_heatmap(subset_data, SIGS$Homing,     "Homing")
+h4 <- sig_heatmap(subset_data, SIGS$Exhaustion, "Exhaustion")
+
+# each panel drawn on its own, then placed side by side. explicit width/height is what
+# stops grabExpr from clipping row names and titles
+as_panel <- function(ht) grid::grid.grabExpr(
+  draw(ht, heatmap_legend_side = "bottom", annotation_legend_side = "bottom",
+       padding = unit(c(2, 6, 2, 6), "mm")),
+  width = 3.2, height = 6)
+
+cowplot::plot_grid(as_panel(h1), as_panel(h2), as_panel(h3), as_panel(h4), nrow = 1)
+```
+
+```{r}
+# 1. Pipeline Overview & High-Level Accounting
+s1_pipeline_summary <- tibble::tribble(
+  ~Metric, ~Value, ~Pct_of_External_Flagged,
+  "Total Extcalls Cells", n_cert, NA_real_,
+  "Total Flag+ in Extcalls", n_flag_ext, 100.0,
+  "Flag+ in Global Object", ifelse(exists("in_glob"), length(in_glob), NA), ifelse(exists("in_glob"), round(100 * length(in_glob) / n_flag_ext, 2), NA),
+  "Flag+ Transferred to subset", n_flag_sub, round(100 * n_flag_sub / n_flag_ext, 2),
+  "Flag+ Lost Outside subset", n_flag_ext - n_flag_sub, round(100 * (n_flag_ext - n_flag_sub) / n_flag_ext, 2),
+  "Flag+ Retained in Plotting", n_flag_sub - n_flag_dropped, round(100 * (n_flag_sub - n_flag_dropped) / n_flag_ext, 2),
+  "Flag+ Dropped (Outlier/Unassigned/Undefined)", n_flag_dropped, round(100 * n_flag_dropped / n_flag_ext, 2)
+)
+
+# 2. Global Broad Cell Type Breakdown
+s2_global_broad <- if (exists("flag_broad")) flag_broad else tibble(Note = "Global object file not found")
+
+# 3. Comprehensive T-Cell Cluster Breakdown (All clusters)
+s3_cluster_metrics <- subset_data@meta.data %>%
+  group_by(cluster_label) %>%
+  summarise(
+    total_cells = n(),
+    flag_pos_cells = sum(flag_pos),
+    flag_neg_cells = sum(!flag_pos),
+    pct_flag_pos_in_cluster = round(100 * mean(flag_pos), 2),
+    pct_of_total_flag_in_subset = round(100 * sum(flag_pos) / max(n_flag_sub, 1), 2),
+    plot_status = ifelse(cluster_label %in% drop_labels, "Dropped", "Retained"),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(flag_pos_cells))
+
+# 4. Sample and Condition Metrics
+s4_sample_metrics <- subset_data@meta.data %>%
+  group_by(condition, category_plot) %>%
+  summarise(
+    total_cells = n(),
+    flag_pos_cells = sum(flag_pos),
+    flag_neg_cells = sum(!flag_pos),
+    pct_flag_pos_in_sample = round(100 * mean(flag_pos), 2),
+    pct_of_total_flag_in_subset = round(100 * sum(flag_pos) / max(n_flag_sub, 1), 2),
+    .groups = "drop"
+  )
+
+# 5. CD4/CD8 Lineage & flag Cross-Tabulation
+md_lineage <- subset_data@meta.data %>%
+  mutate(sublineage_label = dplyr::case_when(
+    is.pure_B == "Pure" & is.pure_A != "Pure" ~ "CD8",
+    is.pure_A == "Pure" & is.pure_B != "Pure" ~ "CD4",
+    is.pure_B == "Pure" & is.pure_A == "Pure" ~ "Multi",
+    TRUE ~ "Unassigned"
+  ))
+
+s5_lineage_metrics <- md_lineage %>%
+  group_by(condition, category_plot, sublineage_label) %>%
+  summarise(
+    flag_pos_count = sum(flag_pos),
+    flag_neg_count = sum(!flag_pos),
+    total_cells = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(category_plot) %>%
+  mutate(pct_of_sample_car = round(100 * flag_pos_count / max(sum(flag_pos_count), 1), 2)) %>%
+  ungroup()
+
+# 6. QC Metrics & UCell Scores Summary Statistics by flag Status
+qc_cols <- intersect(
+  c("extcalls_scDblFinder_score", "scDblFinder_score", "Tcell_UCell", 
+    "CD4Tcell_UCell", "CD8T_UCell", "Talphabeta_UCell", "Tgammadelta_UCell", "Treg_UCell"),
+  colnames(subset_data@meta.data)
+)
+
+s6_qc_ucell_stats <- md_lineage %>%
+  dplyr::select(flag_pos, all_of(qc_cols)) %>%
+  pivot_longer(-flag_pos, names_to = "Metric", values_to = "Value") %>%
+  filter(!is.na(Value)) %>%
+  group_by(Metric, flag_pos) %>%
+  summarise(
+    Mean = round(mean(Value), 4),
+    Median = round(median(Value), 4),
+    SD = round(sd(Value), 4),
+    IQR = round(IQR(Value), 4),
+    Min = round(min(Value), 4),
+    Max = round(max(Value), 4),
+    .groups = "drop"
+  ) %>%
+  mutate(Flag_Status = ifelse(flag_pos, "Flag+", "Flag-")) %>%
+  dplyr::select(Metric, Flag_Status, Mean, Median, SD, IQR, Min, Max)
+
+# Export Workbook
+metrics_workbook <- list(
+  "Pipeline_Overview"      = s1_pipeline_summary,
+  "Global_Broad_Labels"    = s2_global_broad,
+  "T_Cluster_Breakdown"    = s3_cluster_metrics,
+  "Sample_Condition_Stats" = s4_sample_metrics,
+  "Lineage_CD4_CD8"        = s5_lineage_metrics,
+  "QC_and_UCell_Stats"     = s6_qc_ucell_stats
+)
+
+writexl::write_xlsx(metrics_workbook,
+                    path = file.path(csv_dir, paste0(FILE_PREFIX, "_flag_metrics.xlsx")))
+```
+

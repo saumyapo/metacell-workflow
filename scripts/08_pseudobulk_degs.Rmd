@@ -1,0 +1,659 @@
+---
+title: "08 Pseudobulk differential expression"
+author: "Saumya Pothukuchi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: cosmo
+    code_folding: hide
+---
+
+```{r, include=FALSE}
+options(width = 60)
+local({
+  hook_output <- knitr::knit_hooks$get('output')
+  knitr::knit_hooks$set(output = function(x, options) {
+    if (!is.null(options$max.height)) options$attr.output <- c(
+      options$attr.output, sprintf('style="max-height: %s;"', options$max.height))
+    hook_output(x, options)
+  })
+})
+```
+
+```{r, results = FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(Seurat)
+library(Matrix)
+library(DESeq2)
+library(edgeR)
+library(limma)
+library(variancePartition)
+library(BiocParallel)
+library(ashr)
+library(ggplot2)
+library(ggrepel)
+library(openxlsx)
+```
+
+### Information of Used R Libraries
+
+R: `r R.Version()$version.string`,
+Seurat: `r packageVersion('Seurat')`,
+DESeq2: `r packageVersion('DESeq2')`,
+edgeR: `r packageVersion('edgeR')`,
+limma: `r packageVersion('limma')`,
+variancePartition: `r packageVersion('variancePartition')`,
+ashr: `r packageVersion('ashr')`
+
+# Why pseudobulk
+
+The replicate is the patient, not the cell. Counts are summed to one profile per
+replicate unit before any test is run, and the model is fitted on those units.
+
+Which unit is the replicate depends on the contrast, and the four families below each
+use a different one. The table of contrast against unit against design, and why testing
+single cells directly does not control the false positive rate, are in
+docs/10_differential_expression.md.
+
+# Configuration
+
+```{r, results = FALSE, message=FALSE, warning=FALSE}
+# LEVEL selects which annotated object this notebook runs on. Nothing else in
+# the file is level-specific, so a subset run is a one-word edit here.
+#   "global"  the whole dataset, annotated by broad lineage in 03
+#   "subset"  one lineage, annotated by state in 05
+LEVEL <- "subset"
+
+source(file.path("..", "config", "config.R"))
+
+CFG <- switch(LEVEL,
+  global = list(slug = "global", prefix = "global",      label = "broad_label",
+                title = "All cell types"),
+  subset = list(slug = "subset", prefix = "subset_data", label = "cluster_label",
+                title = "Subset"),
+  stop("LEVEL must be 'global' or 'subset'"))
+
+SUBSET_SLUG  <- CFG$slug
+FILE_PREFIX  <- CFG$prefix
+LABEL_COL    <- CFG$label     # per-cell annotation column written by 03 or 05
+SUBSET_TITLE <- CFG$title     # appears in every figure title
+
+# the annotated Seurat object written at the end of 03 (global) or 05 (subset)
+rds_path <- file.path(DIR_RDS, SUBSET_SLUG, "metacell",
+                      paste0(FILE_PREFIX, "_MC_annotated.RDS"))
+
+# One folder per contrast family. Keeping them apart means a family can be
+# rerun, or dropped, without touching the others, and the aggregate workbook
+# at the end just globs the folder.
+deg_root <- file.path(out_dirs(SUBSET_SLUG, "csv"), "DEGs")
+DIR_COND <- file.path(deg_root, "condition")                            # family 1
+DIR_WITH <- file.path(deg_root, "within_condition_timepoint")           # family 2
+DIR_BTWN <- file.path(deg_root, "between_condition_timepoint")          # family 3
+DIR_INTX <- file.path(deg_root, "condition_by_timepoint_interaction")   # family 4
+DIR_OMNI <- file.path(DIR_INTX, "omnibus")                              # unsigned F tests
+fig_dir  <- file.path(out_dirs(SUBSET_SLUG, "pdf"), "DEGs")
+for (d in c(DIR_COND, DIR_WITH, DIR_BTWN, DIR_INTX, DIR_OMNI, fig_dir))
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+# set FALSE to run only the pooled ("all") analysis and skip the per-cluster loop
+RUN_CLUSTER_WISE <- TRUE
+# the interaction is fitted pooled first; flip to TRUE for the per-cluster pass
+RUN_CLUSTER_WISE_INTERACTION <- FALSE
+
+MIN_CELLS           <- 20   # a pseudobulk unit needs this many cells or it is dropped
+MIN_UNITS_PER_GROUP <- 2    # DESeq2 cannot estimate within-group dispersion below this
+MIN_COUNT           <- 10   # filterByExpr, per-unit count floor
+MIN_TOTAL_COUNT     <- 15   # filterByExpr, across-unit count floor
+MIN_GENES_TESTED    <- 200  # below this the fit is not worth reporting
+
+# volcano thresholds, presentation only, they do not affect the tables
+VOLC_P_COL   <- "p_val"
+VOLC_P_CUT   <- 0.05
+VOLC_LFC_CUT <- 0.25
+```
+
+# Load
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+obj <- readRDS(rds_path)
+obj <- JoinLayers(obj)
+stopifnot(LABEL_COL %in% colnames(obj@meta.data))
+
+cts_all <- GetAssayData(obj, assay = "RNA", layer = "counts")
+md_all  <- obj@meta.data
+md_all$cell_label <- as.character(md_all[[LABEL_COL]])
+md_all$patient_id <- as.character(md_all$patient_id)
+md_all$condition  <- factor(as.character(md_all$condition), levels = COND_LEVELS)
+md_all$timepoint  <- factor(as.character(md_all$timepoint), levels = TP_LEVELS)
+md_all$sample_origin <- as.character(md_all$sample_origin)
+
+stopifnot(identical(colnames(cts_all), rownames(md_all)))
+stopifnot(!anyNA(md_all$condition), !anyNA(md_all$timepoint))
+# counts layer must be raw UMIs
+stopifnot(all(cts_all@x == floor(cts_all@x)))
+
+cells_base <- rownames(md_all)[!md_all$cell_label %in% drop_labels]
+cat("Cells retained:", length(cells_base), "of", nrow(md_all), "\n")
+
+# one sample per patient per timepoint is what makes the between-condition models unpaired
+stopifnot(!anyDuplicated(unique(md_all[, c("sample_origin", "patient_id", "timepoint")])$sample_origin))
+print(table(md_all$condition, md_all$timepoint))
+```
+
+
+# Helpers
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+slugify <- function(x) gsub("^_+|_+$", "", gsub("[^A-Za-z0-9]+", "_", x))
+
+units_to_run <- c("all",
+  if (RUN_CLUSTER_WISE) sort(setdiff(unique(md_all$cell_label), drop_labels)) else NULL)
+
+cells_of <- function(unit)
+  if (unit == "all") cells_base else cells_base[md_all[cells_base, "cell_label"] == unit]
+
+# Sum raw counts per level of group_col. Version-proof, no AggregateExpression ambiguity.
+pb_sum <- function(cells, group_col, min_cells = MIN_CELLS) {
+  if (!length(cells)) return(NULL)
+  grp  <- factor(as.character(md_all[cells, group_col]))
+  ok   <- names(which(table(grp) >= min_cells))
+  keep <- grp %in% ok
+  if (!any(keep)) return(NULL)
+  cells <- cells[keep]; grp <- droplevels(grp[keep])
+  # built directly rather than via sparse.model.matrix: a one-level factor has no
+  # contrasts, and after the min-cell filter a rare cluster can legitimately leave one unit
+  mm <- Matrix::sparseMatrix(i = seq_along(grp), j = as.integer(grp), x = 1,
+                             dims = c(length(grp), nlevels(grp)),
+                             dimnames = list(NULL, levels(grp)))
+  round(as.matrix(cts_all[, cells, drop = FALSE] %*% mm))   # genes x units
+}
+
+# One row per pseudobulk unit. keep_cols must be constant inside a unit or the mapping
+# is not well defined, so that is asserted rather than assumed.
+pb_coldata <- function(cells, group_col, keep_cols, units) {
+  md <- md_all[cells, c(group_col, keep_cols), drop = FALSE]
+  g  <- as.character(md[[group_col]])
+  for (k in keep_cols)
+    stopifnot(all(tapply(as.character(md[[k]]), g, function(v) length(unique(v))) == 1))
+  out <- md[!duplicated(g), keep_cols, drop = FALSE]
+  rownames(out) <- g[!duplicated(g)]
+  droplevels(out[units, , drop = FALSE])
+}
+
+MANIFEST <- list()
+
+# DESeq2 on a pseudobulk matrix. Returns NULL when the design cannot support the
+# contrast, so a skipped comparison is visible in the manifest instead of a bad table.
+run_pb_deseq <- function(pb, coldata, design, contrast) {
+  if (is.null(pb) || ncol(pb) < 2) return(NULL)
+  coldata <- droplevels(coldata[colnames(pb), , drop = FALSE])
+  if (anyNA(coldata)) return(NULL)
+
+  grp <- coldata[[contrast[1]]]
+  if (!all(contrast[2:3] %in% levels(grp))) return(NULL)
+  if (min(sum(grp == contrast[2]), sum(grp == contrast[3])) < MIN_UNITS_PER_GROUP) return(NULL)
+
+  mm <- model.matrix(design, coldata)
+  if (qr(mm)$rank < ncol(mm)) return(NULL)          # singular or fully nested design
+  if (nrow(mm) - ncol(mm) < 1)  return(NULL)        # no residual degrees of freedom
+
+  keep <- edgeR::filterByExpr(pb, design = mm, lib.size = colSums(pb),
+                              min.count = MIN_COUNT, min.total.count = MIN_TOTAL_COUNT)
+  if (sum(keep) < MIN_GENES_TESTED) return(NULL)
+
+  dds  <- DESeqDataSetFromMatrix(pb[keep, , drop = FALSE], colData = coldata, design = design)
+  dds  <- DESeq(dds, quiet = TRUE)
+  res  <- results(dds, contrast = contrast)
+  resS <- lfcShrink(dds, contrast = contrast, type = "ashr", quiet = TRUE)
+
+  data.frame(
+    gene       = rownames(res),
+    baseMean   = res$baseMean,
+    avg_log2FC = resS$log2FoldChange,   # shrunken, for volcano
+    lfcSE      = res$lfcSE,
+    stat       = res$stat,              # unshrunken Wald stat, for GSEA ranking
+    p_val      = res$pvalue,
+    p_val_adj  = res$padj,
+    row.names  = NULL
+  ) %>% arrange(p_val)
+}
+
+# Single entry point: runs the contrast, writes the csv, logs the manifest row.
+run_and_save <- function(pb, coldata, design, contrast, family, dir_out, unit, tag) {
+  n_ref <- n_test <- NA_integer_
+  if (!is.null(pb)) {
+    cd <- droplevels(coldata[colnames(pb), , drop = FALSE])
+    if (contrast[1] %in% colnames(cd)) {
+      n_test <- sum(cd[[contrast[1]]] == contrast[2])
+      n_ref  <- sum(cd[[contrast[1]]] == contrast[3])
+    }
+  }
+  res <- tryCatch(run_pb_deseq(pb, coldata, design, contrast), error = function(e) NULL)
+
+  if (is.null(res)) {
+    MANIFEST[[length(MANIFEST) + 1]] <<- data.frame(
+      family = family, unit = unit, contrast = tag, n_test = n_test, n_ref = n_ref,
+      n_genes_tested = NA_integer_, n_padj05 = NA_integer_, status = "skipped")
+    return(invisible(NULL))
+  }
+
+  f <- file.path(dir_out, paste0(FILE_PREFIX, "__", slugify(unit), "__", tag, ".csv"))
+  write.csv(res, f, row.names = FALSE)
+  MANIFEST[[length(MANIFEST) + 1]] <<- data.frame(
+    family = family, unit = unit, contrast = tag, n_test = n_test, n_ref = n_ref,
+    n_genes_tested = nrow(res), n_padj05 = sum(res$p_val_adj < 0.05, na.rm = TRUE),
+    status = if (min(n_test, n_ref) < 3) "exploratory" else "ok")
+  invisible(res)
+}
+```
+
+# Family 1: CASE vs CTRL, patient level
+
+Condition varies between patients, so the patient is the replicate and all of a patient's
+timepoints are pooled into one profile. This is the headline contrast.
+
+```{r, message=FALSE, warning=FALSE}
+for (u in units_to_run) {
+  cells <- cells_of(u)
+  pb <- pb_sum(cells, "patient_id")
+  if (is.null(pb)) next
+  cd <- pb_coldata(cells, "patient_id", c("condition"), colnames(pb))
+  cd$condition <- factor(as.character(cd$condition), levels = COND_LEVELS)
+  run_and_save(pb, cd, ~ condition, c("condition", "CASE", "CTRL"),
+               "condition", DIR_COND, u, "CASE_vs_CTRL")
+}
+```
+
+# Family 2: timepoint contrasts within a condition, paired
+
+Every pairwise timepoint contrast is run inside each condition. Only patients sampled at
+**both** timepoints of a given pair are kept, so `~ patient_id + timepoint` is a genuine
+paired design: a patient present at one timepoint only cannot inform the difference, and
+leaving it in makes the design matrix rank deficient in exactly the cases that matter,
+which is any timepoint carried by a single patient.
+
+```{r, message=FALSE, warning=FALSE}
+tp_pairs <- do.call(rbind, lapply(seq_len(length(TP_LEVELS) - 1), function(i)
+  do.call(rbind, lapply((i + 1):length(TP_LEVELS), function(j)
+    data.frame(earlier = TP_LEVELS[i], later = TP_LEVELS[j], stringsAsFactors = FALSE)))))
+
+for (u in units_to_run) {
+  cells_u <- cells_of(u)
+  if (!length(cells_u)) next
+  for (cnd in COND_LEVELS) {
+    cells_c <- cells_u[md_all[cells_u, "condition"] == cnd]
+    if (!length(cells_c)) next
+    md_c <- md_all[cells_c, ]
+    for (k in seq_len(nrow(tp_pairs))) {
+      a <- tp_pairs$earlier[k]; b <- tp_pairs$later[k]
+      pats <- intersect(unique(md_c$patient_id[md_c$timepoint == a]),
+                        unique(md_c$patient_id[md_c$timepoint == b]))
+      if (length(pats) < MIN_UNITS_PER_GROUP) next
+      sel <- cells_c[md_c$timepoint %in% c(a, b) & md_c$patient_id %in% pats]
+      pb  <- pb_sum(sel, "sample_origin")
+      if (is.null(pb)) next
+      cd <- pb_coldata(sel, "sample_origin", c("patient_id", "timepoint"), colnames(pb))
+      cd$patient_id <- droplevels(factor(cd$patient_id))
+      cd$timepoint  <- droplevels(factor(as.character(cd$timepoint), levels = TP_LEVELS))
+      # a patient must still be complete after the min-cell filter or the pairing breaks
+      complete <- names(which(table(cd$patient_id) == 2))
+      cd <- cd[cd$patient_id %in% complete, , drop = FALSE]
+      pb <- pb[, rownames(cd), drop = FALSE]
+      if (ncol(pb) < 2 * MIN_UNITS_PER_GROUP) next
+      cd$patient_id <- droplevels(cd$patient_id)
+      run_and_save(pb, cd, ~ patient_id + timepoint, c("timepoint", b, a),
+                   "within_condition_timepoint", DIR_WITH, u, paste0(cnd, "__", b, "_vs_", a))
+    }
+  }
+}
+```
+
+# Family 3: CASE vs CTRL at each timepoint, unpaired
+
+Each patient contributes one sample per timepoint, so there is nothing to block on and
+`~ condition` is the correct design. Timepoints where either arm has fewer than
+`MIN_UNITS_PER_GROUP` patients are skipped by the guard rather than fitted.
+
+```{r, message=FALSE, warning=FALSE}
+for (u in units_to_run) {
+  cells_u <- cells_of(u)
+  if (!length(cells_u)) next
+  for (tp in TP_LEVELS) {
+    sel <- cells_u[md_all[cells_u, "timepoint"] == tp]
+    if (!length(sel)) next
+    pb <- pb_sum(sel, "sample_origin")
+    if (is.null(pb)) next
+    cd <- pb_coldata(sel, "sample_origin", c("condition", "patient_id"), colnames(pb))
+    cd$condition <- factor(as.character(cd$condition), levels = COND_LEVELS)
+    run_and_save(pb, cd, ~ condition, c("condition", "CASE", "CTRL"),
+                 "between_condition_timepoint", DIR_BTWN, u, paste0("CASE_vs_CTRL__at_", tp))
+  }
+}
+```
+
+# Family 4: condition x timepoint interaction
+
+The first three families never ask whether one arm *changes differently* from the other.
+The interaction term is the difference of those differences, which is the trajectory
+question.
+
+DESeq2 cannot fit it: patient is nested inside condition, so a patient's fixed effect
+already encodes their condition and the design matrix is rank deficient. Patient enters
+as a random intercept instead, which means a mixed model per gene.
+`variancePartition::dream` does that, with `voomWithDreamWeights` for precision weights
+and `eBayes` for variance moderation. Background: docs/10_differential_expression.md.
+
+Two outputs. The **omnibus** test is a moderated F over all interaction coefficients
+jointly, and lands in a subfolder because an F statistic is unsigned and cannot rank a
+GSEA list. The **per-timepoint** tables give one signed coefficient each.
+
+```{r, message=FALSE, warning=FALSE}
+# a timepoint enters the interaction only if both arms clear MIN_UNITS_PER_GROUP there
+pat_tp <- md_all %>%
+  distinct(patient_id, condition, timepoint) %>%
+  dplyr::count(condition, timepoint, name = "n_pat")
+tp_intx <- intersect(TP_LEVELS, Reduce(intersect, lapply(COND_LEVELS, function(cnd)
+  as.character(pat_tp$timepoint[pat_tp$condition == cnd & pat_tp$n_pat >= MIN_UNITS_PER_GROUP]))))
+TP_REF <- if (length(tp_intx)) tp_intx[1] else NA_character_
+cat("Timepoints in the interaction model:", paste(tp_intx, collapse = ", "),
+    "| reference:", TP_REF, "\n")
+
+run_interaction <- function(cells, unit) {
+  log_skip <- function() {
+    MANIFEST[[length(MANIFEST) + 1]] <<- data.frame(
+      family = "condition_by_timepoint_interaction", unit = unit, contrast = "all_interaction",
+      n_test = NA_integer_, n_ref = NA_integer_, n_genes_tested = NA_integer_,
+      n_padj05 = NA_integer_, status = "skipped")
+  }
+  if (length(tp_intx) < 2) { log_skip(); return(invisible(NULL)) }
+
+  sel <- cells[md_all[cells, "timepoint"] %in% tp_intx]
+  pb  <- pb_sum(sel, "sample_origin")
+  if (is.null(pb)) { log_skip(); return(invisible(NULL)) }
+
+  cd <- pb_coldata(sel, "sample_origin", c("patient_id", "condition", "timepoint"), colnames(pb))
+  cd$condition  <- factor(as.character(cd$condition), levels = COND_LEVELS)
+  cd$timepoint  <- factor(as.character(cd$timepoint), levels = tp_intx)
+  cd$patient_id <- droplevels(factor(cd$patient_id))
+
+  # the min-cell filter can empty a condition x timepoint cell, so recheck after it
+  ok <- all(table(cd$condition, cd$timepoint) >= MIN_UNITS_PER_GROUP)
+  if (!ok || nlevels(cd$patient_id) < 3) { log_skip(); return(invisible(NULL)) }
+
+  mm <- model.matrix(~ condition * timepoint, cd)
+  if (qr(mm)$rank < ncol(mm) || nrow(mm) - ncol(mm) < 1) { log_skip(); return(invisible(NULL)) }
+
+  dge  <- edgeR::DGEList(pb[, rownames(cd), drop = FALSE])
+  keep <- edgeR::filterByExpr(dge, design = mm, min.count = MIN_COUNT,
+                              min.total.count = MIN_TOTAL_COUNT)
+  if (sum(keep) < MIN_GENES_TESTED) { log_skip(); return(invisible(NULL)) }
+  dge <- edgeR::calcNormFactors(dge[keep, , keep.lib.sizes = FALSE])
+
+  form <- ~ condition * timepoint + (1 | patient_id)
+  fit <- tryCatch({
+    vobj <- variancePartition::voomWithDreamWeights(dge, form, cd, quiet = TRUE,
+                                                    BPPARAM = BiocParallel::SerialParam())
+    variancePartition::eBayes(
+      variancePartition::dream(vobj, form, cd, BPPARAM = BiocParallel::SerialParam()))
+  }, error = function(e) NULL)
+  if (is.null(fit)) { log_skip(); return(invisible(NULL)) }
+
+  intx <- grep(":timepoint", colnames(coef(fit)), value = TRUE)
+  if (!length(intx)) { log_skip(); return(invisible(NULL)) }
+
+  log_row <- function(contrast, n_gen, n_sig, status)
+    MANIFEST[[length(MANIFEST) + 1]] <<- data.frame(
+      family = "condition_by_timepoint_interaction", unit = unit, contrast = contrast,
+      n_test = sum(cd$condition == "CASE"), n_ref = sum(cd$condition == "CTRL"),
+      n_genes_tested = n_gen, n_padj05 = n_sig,
+      status = if (min(table(cd$condition)) < 3) "exploratory" else status)
+
+  # omnibus, moderated F across every interaction coefficient
+  tt <- limma::topTable(fit, coef = intx, number = Inf, sort.by = "F")
+  omni <- data.frame(gene = rownames(tt), AveExpr = tt$AveExpr, F_stat = tt$F,
+                     p_val = tt$P.Value, p_val_adj = tt$adj.P.Val, row.names = NULL)
+  write.csv(omni, file.path(DIR_OMNI,
+    paste0(FILE_PREFIX, "__", slugify(unit), "__interaction_omnibus.csv")), row.names = FALSE)
+  log_row(paste0("omnibus_vs_", TP_REF), nrow(omni),
+          sum(omni$p_val_adj < 0.05, na.rm = TRUE), "ok")
+
+  # one signed table per interaction coefficient, rankable for GSEA
+  for (cf in intx) {
+    tp <- sub("^.*:timepoint", "", cf)
+    t2 <- limma::topTable(fit, coef = cf, number = Inf, sort.by = "P")
+    out <- data.frame(gene = rownames(t2), AveExpr = t2$AveExpr,
+                      avg_log2FC = t2$logFC, lfcSE = t2$logFC / t2$t, stat = t2$t,
+                      p_val = t2$P.Value, p_val_adj = t2$adj.P.Val, row.names = NULL)
+    write.csv(out, file.path(DIR_INTX, paste0(FILE_PREFIX, "__", slugify(unit),
+      "__CASE_vs_CTRL__", tp, "_vs_", TP_REF, ".csv")), row.names = FALSE)
+    log_row(paste0("CASE_vs_CTRL__", tp, "_vs_", TP_REF), nrow(out),
+            sum(out$p_val_adj < 0.05, na.rm = TRUE), "ok")
+  }
+  invisible(NULL)
+}
+
+intx_units <- c("all", if (RUN_CLUSTER_WISE_INTERACTION) setdiff(units_to_run, "all") else NULL)
+for (u in intx_units) {
+  cells <- cells_of(u)
+  if (length(cells)) run_interaction(cells, u)
+}
+```
+
+# Run manifest
+
+Every attempted contrast is listed with the number of pseudobulk units on each side, so a
+comparison that was skipped is distinguishable from one that was never asked for, and a
+result resting on two units per arm is labelled `exploratory` rather than read as though
+it had the same standing as the headline contrast.
+
+```{r, message=FALSE, warning=FALSE}
+manifest <- bind_rows(MANIFEST)
+write.xlsx(manifest, file.path(deg_root, paste0(FILE_PREFIX, "_DEG_run_manifest.xlsx")),
+           rowNames = FALSE)
+print(as.data.frame(manifest %>% filter(unit == "all")))
+cat("\nContrasts run:", sum(manifest$status != "skipped"),
+    " skipped:", sum(manifest$status == "skipped"), "\n")
+```
+
+# Biotype annotation
+
+```{r, message=FALSE, warning=FALSE}
+library(stringr); library(readr)
+
+gencode_gtf <- file.path(PROJ, "..", "reference", "gencode.v32.annotation.gtf.gz")
+deg_files <- list.files(c(DIR_COND, DIR_WITH, DIR_BTWN, DIR_INTX, DIR_OMNI),
+                        pattern = "\\.csv$", full.names = TRUE)
+
+if (file.exists(gencode_gtf)) {
+  g <- rtracklayer::import(gencode_gtf)
+  genes <- as.data.frame(S4Vectors::mcols(g)) %>%
+    filter(type == "gene") %>%
+    select(gene_id, gene_name, gene_type) %>%
+    distinct(gene_name, .keep_all = TRUE)
+
+  for (f in deg_files) {
+    degs <- read_csv(f, show_col_types = FALSE) %>%
+      left_join(genes, by = c("gene" = "gene_name")) %>%
+      mutate(
+        biotype_class = case_when(
+          str_detect(gene_type, "pseudogene") ~ "pseudogene",
+          str_detect(gene_type, regex("IG|TR", ignore_case = TRUE)) ~ "IG_TR_gene",
+          str_detect(gene_type, "lncRNA") ~ "lncRNA",
+          str_detect(gene_type, "uncharacterized|unknown") ~ "uncharacterized",
+          str_detect(gene_type, "protein_coding") ~ "protein_coding",
+          TRUE ~ "other"),
+        remove_flag = biotype_class %in% c("pseudogene", "lncRNA", "IG_TR_gene", "uncharacterized"))
+    write_csv(degs, f)   # annotate in place, GSEA reads the same files
+  }
+} else {
+  warning("gencode gtf not found, DEG csvs left unannotated: ", gencode_gtf)
+}
+```
+
+# Volcano plots
+
+```{r, results='asis', message=FALSE, warning=FALSE}
+volcanoplot <- function(de, title_str) {
+  if ("remove_flag" %in% names(de))
+    de <- de %>% filter(is.na(remove_flag) | !remove_flag)
+  de <- de %>% filter(!grepl("^MT-", gene), !grepl("^RP[SL]", gene))
+  pv <- de[[VOLC_P_COL]]
+  de$diffexpressed <- "NO"
+  de$diffexpressed[de$avg_log2FC < -VOLC_LFC_CUT & pv < VOLC_P_CUT] <- "DOWN"
+  de$diffexpressed[de$avg_log2FC >  VOLC_LFC_CUT & pv < VOLC_P_CUT] <- "UP"
+  c1 <- de %>% filter(diffexpressed == "UP")   %>% arrange(desc(avg_log2FC)) %>% head(10)
+  c2 <- de %>% filter(diffexpressed == "DOWN") %>% arrange(avg_log2FC)       %>% head(10)
+  de$delabel <- ifelse(de$gene %in% unique(c(c1$gene, c2$gene)), de$gene, NA)
+  ggplot(de, aes(avg_log2FC, -log10(.data[[VOLC_P_COL]]), col = diffexpressed, label = delabel)) +
+    geom_vline(xintercept = c(-VOLC_LFC_CUT, VOLC_LFC_CUT), col = "gray", linetype = "dashed") +
+    geom_hline(yintercept = -log10(VOLC_P_CUT), col = "gray", linetype = "dashed") +
+    geom_point(alpha = 0.5, size = 0.8) +
+    geom_text_repel(size = 2, max.overlaps = Inf, show.legend = FALSE) +
+    scale_color_manual(values = c("UP" = "#bb0c00", "DOWN" = "#00AFBB", "NO" = "gray")) +
+    labs(x = "shrunken avg log2FC", y = paste0("-log10 ", VOLC_P_COL), title = title_str) +
+    theme_bw() + theme(plot.title = element_text(hjust = 0.5, size = 9))
+}
+
+pdf(file.path(fig_dir, paste0(FILE_PREFIX, "_volcanoes.pdf")), width = 6, height = 5)
+for (f in deg_files) {
+  tag <- sub("\\.csv$", "", basename(f))
+  de  <- read.csv(f)
+  if (!nrow(de) || !("avg_log2FC" %in% names(de))) next   # omnibus F tables are unsigned
+  cat("##", tag, "\n")
+  p <- volcanoplot(de, paste0(SUBSET_TITLE, ": ", tag))
+  print(p)
+  cat("\n\n")
+}
+invisible(dev.off())
+```
+
+# Aggregate workbook
+
+```{r, message=FALSE, warning=FALSE}
+for (fam in list(c("condition", DIR_COND), c("within_condition_timepoint", DIR_WITH),
+                 c("between_condition_timepoint", DIR_BTWN),
+                 c("condition_by_timepoint_interaction", DIR_INTX),
+                 c("condition_by_timepoint_interaction_omnibus", DIR_OMNI))) {
+  fs <- list.files(fam[2], pattern = "\\.csv$", full.names = TRUE)
+  if (!length(fs)) next
+  sheets <- lapply(fs, read.csv)
+  nm <- sub(paste0("^", FILE_PREFIX, "__"), "", sub("\\.csv$", "", basename(fs)))
+  
+  # Shorten to 27 chars first, then make unique so '_1', '_2' fit under the 31-char limit
+  nm_short <- substr(nm, 1, 27)
+  names(sheets) <- make.unique(nm_short, sep = "_")
+  
+  write.xlsx(sheets, file.path(deg_root,
+    paste0(FILE_PREFIX, "_pseudobulk_DEGs_", fam[1], ".xlsx")), rowNames = FALSE)
+}
+```
+
+# Volcano plots and aggregate workbooks
+
+```{r, message=FALSE, warning=FALSE}
+FAMS <- list(
+  c("condition",                                   DIR_COND),
+  c("within_condition_timepoint",                  DIR_WITH),
+  c("between_condition_timepoint",                 DIR_BTWN),
+  c("condition_by_timepoint_interaction",          DIR_INTX),
+  c("condition_by_timepoint_interaction_omnibus",  DIR_OMNI))
+
+# The filename already encodes unit and contrast. Lifting them into columns keeps the
+# sheet name down to the cluster, which is the only part that has to be unique per sheet.
+annot_cols <- function(f, fam) {
+  p <- strsplit(sub(paste0("^", FILE_PREFIX, "__"), "",
+                    sub("\\.csv$", "", basename(f))), "__", fixed = TRUE)[[1]]
+  out <- switch(fam,
+    condition                   = data.frame(comparison = "CASE_vs_CTRL",
+                                             timepoint  = "pooled", reference = NA_character_),
+    within_condition_timepoint  = data.frame(comparison = p[2],
+                                             timepoint  = sub("_vs_.*$", "", p[3]),
+                                             reference  = sub("^.*_vs_", "", p[3])),
+    between_condition_timepoint = data.frame(comparison = "CASE_vs_CTRL",
+                                             timepoint  = sub("^at_", "", p[3]),
+                                             reference  = NA_character_),
+    condition_by_timepoint_interaction =
+                                  data.frame(comparison = "CASE_vs_CTRL",
+                                             timepoint  = sub("_vs_.*$", "", p[3]),
+                                             reference  = sub("^.*_vs_", "", p[3])),
+    condition_by_timepoint_interaction_omnibus =
+                                  data.frame(comparison = "CASE_vs_CTRL",
+                                             timepoint  = "omnibus", reference = NA_character_))
+  cbind(cluster = if (p[1] == "all") "overall" else p[1], out)
+}
+
+load_family <- function(fam, dir_out) {
+  fs <- list.files(dir_out, pattern = "\\.csv$", full.names = TRUE)
+  if (!length(fs)) return(NULL)
+  d <- bind_rows(lapply(fs, function(f) cbind(annot_cols(f, fam), read.csv(f))))
+  d$timepoint <- factor(d$timepoint, levels = intersect(
+    c(TP_LEVELS, "pooled", "omnibus"), unique(d$timepoint)))
+  d %>% arrange(cluster != "overall", cluster, comparison, timepoint)
+}
+```
+
+```{r, results='asis', message=FALSE, warning=FALSE}
+volcanoplot <- function(de, title_str) {
+  if ("remove_flag" %in% names(de))
+    de <- de %>% filter(is.na(remove_flag) | !remove_flag)
+  de <- de %>% filter(!grepl("^MT-", gene), !grepl("^RP[SL]", gene))
+  pv <- de[[VOLC_P_COL]]
+  de$diffexpressed <- "NO"
+  de$diffexpressed[de$avg_log2FC < -VOLC_LFC_CUT & pv < VOLC_P_CUT] <- "DOWN"
+  de$diffexpressed[de$avg_log2FC >  VOLC_LFC_CUT & pv < VOLC_P_CUT] <- "UP"
+  c1 <- de %>% filter(diffexpressed == "UP")   %>% arrange(desc(avg_log2FC)) %>% head(10)
+  c2 <- de %>% filter(diffexpressed == "DOWN") %>% arrange(avg_log2FC)       %>% head(10)
+  de$delabel <- ifelse(de$gene %in% unique(c(c1$gene, c2$gene)), de$gene, NA)
+  ggplot(de, aes(avg_log2FC, -log10(.data[[VOLC_P_COL]]), col = diffexpressed, label = delabel)) +
+    geom_vline(xintercept = c(-VOLC_LFC_CUT, VOLC_LFC_CUT), col = "gray", linetype = "dashed") +
+    geom_hline(yintercept = -log10(VOLC_P_CUT), col = "gray", linetype = "dashed") +
+    geom_point(alpha = 0.5, size = 0.8) +
+    geom_text_repel(size = 2, max.overlaps = Inf, show.legend = FALSE) +
+    scale_color_manual(values = c("UP" = "#bb0c00", "DOWN" = "#00AFBB", "NO" = "gray")) +
+    labs(x = "log2 fold change", y = paste0("-log10 ", VOLC_P_COL), title = title_str) +
+    theme_bw() + theme(plot.title = element_text(hjust = 0.5, size = 9))
+}
+
+# One pdf per family, pages in the same cluster order as that family's workbook sheets
+for (fam in FAMS) {
+  d <- load_family(fam[1], fam[2])
+  if (is.null(d) || !("avg_log2FC" %in% names(d))) next   # omnibus F tables are unsigned
+  pdf(file.path(fig_dir, paste0(FILE_PREFIX, "_volcanoes_", fam[1], ".pdf")),
+      width = 6, height = 5)
+  for (cl in unique(d$cluster)) {
+    for (cmp in unique(d$comparison[d$cluster == cl])) {
+      sub_d <- d %>% filter(cluster == cl, comparison == cmp)
+      for (tp in unique(sub_d$timepoint)) {
+        de <- sub_d %>% filter(timepoint == tp)
+        if (!nrow(de)) next
+        ref <- de$reference[1]
+        ttl <- paste0(cl, " | ", cmp,
+                      if (tp != "pooled") paste0(" | ", tp) else "",
+                      if (!is.na(ref)) paste0(" vs ", ref) else "")
+        cat("##", ttl, "\n")
+        print(volcanoplot(de, paste0(SUBSET_TITLE, ": ", ttl)))
+        cat("\n\n")
+      }
+    }
+  }
+  invisible(dev.off())
+}
+```
+
+```{r, message=FALSE, warning=FALSE}
+# One workbook per family, one sheet per cluster. Contrast identity lives in the
+# cluster / comparison / timepoint / reference columns, not in the sheet name.
+for (fam in FAMS) {
+  d <- load_family(fam[1], fam[2])
+  if (is.null(d)) next
+  sheets <- split(d, factor(d$cluster, levels = unique(d$cluster)))
+  names(sheets) <- make.unique(substr(names(sheets), 1, 28), sep = "_")
+  write.xlsx(sheets, file.path(deg_root,
+    paste0(FILE_PREFIX, "_pseudobulk_DEGs_", fam[1], ".xlsx")), rowNames = FALSE)
+}
+```
+

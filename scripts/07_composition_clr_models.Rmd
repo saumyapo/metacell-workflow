@@ -1,0 +1,457 @@
+---
+title: "07 Composition: CLR models across timepoints"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: cosmo
+    code_folding: show
+---
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyverse)
+library(lme4)
+# lmerTest must be attached: without it anova() on an lmer fit has no p-value column and
+# emmeans falls back to asymptotic z inference, which is anti-conservative at n = 3-5
+library(lmerTest)
+library(emmeans)
+library(ggplot2)
+library(compositions)
+library(purrr)
+library(forcats)
+library(openxlsx)
+```
+
+# Information of Used R Libraries
+
+R: `r R.Version()$version.string`,
+emmeans: `r packageVersion('emmeans')`,
+lme4: `r packageVersion('lme4')`,
+lmerTest: `r packageVersion('lmerTest')`,
+compositions: `r packageVersion('compositions')`,
+tidyverse: `r packageVersion('tidyverse')`
+
+# Method
+
+Cell-type proportions are compositional: they are constrained to sum to 100 within a
+sample, so a real increase in one population forces an apparent decrease in every other.
+The centred log-ratio maps each sample from the simplex into unconstrained Euclidean
+space by dividing every part by the geometric mean of all parts in that sample and
+taking logs, after which ordinary linear models are valid. A CLR value is therefore
+read as abundance relative to the average population in the same sample, not as an
+absolute percentage.
+
+Within a condition, timepoints are compared with `lmer(clr ~ timepoint + (1 | patient_id))`,
+which respects the repeated sampling of the same patient. Between conditions, each
+timepoint is a single sample per patient, so `lm(clr ~ condition)` is the correct
+unpaired model.
+
+# Configuration
+
+```{r, results = FALSE, message=FALSE, warning=FALSE}
+# LEVEL selects which annotated object this notebook runs on. Nothing else in
+# the file is level-specific, so a subset run is a one-word edit here.
+#   "global"  the whole dataset, annotated by broad lineage in 03
+#   "subset"  one lineage, annotated by state in 05
+LEVEL <- "subset"
+
+source(file.path("..", "config", "config.R"))
+
+CFG <- switch(LEVEL,
+  global = list(slug = "global", prefix = "global",      label = "broad_label",
+                title = "All cell types"),
+  subset = list(slug = "subset", prefix = "subset_data", label = "cluster_label",
+                title = "Subset"),
+  stop("LEVEL must be 'global' or 'subset'"))
+
+SUBSET_SLUG  <- CFG$slug
+FILE_PREFIX  <- CFG$prefix
+LABEL_COL    <- CFG$label     # per-cell annotation column written by 03 or 05
+SUBSET_TITLE <- CFG$title     # appears in every figure title
+
+# the annotated Seurat object written at the end of 03 (global) or 05 (subset)
+rds_path <- file.path(DIR_RDS, SUBSET_SLUG, "metacell",
+                      paste0(FILE_PREFIX, "_MC_annotated.RDS"))
+
+# output trees for this step, created on demand
+csv_dir <- out_dirs(SUBSET_SLUG, "csv")
+fig_dir <- out_dirs(SUBSET_SLUG, "pdf")
+
+# a timepoint needs at least this many patients in a condition before it enters any model
+MIN_PATIENTS_PER_TP <- 2
+```
+
+# Read RDS and design availability
+
+```{r}
+obj <- readRDS(rds_path)
+stopifnot(LABEL_COL %in% colnames(obj@meta.data))
+
+cat("Cells total:                            ", ncol(obj), "\n")
+print(table(obj@meta.data[[LABEL_COL]], useNA = "ifany"))
+cat("Cells dropped (no cell type call):      ",
+    sum(obj@meta.data[[LABEL_COL]] %in% drop_labels), "\n")
+
+avail <- obj@meta.data %>%
+  distinct(patient_id, condition, timepoint) %>%
+  mutate(timepoint = factor(as.character(timepoint), levels = TP_LEVELS),
+         condition = factor(as.character(condition), levels = COND_LEVELS)) %>%
+  dplyr::count(condition, timepoint, .drop = FALSE) %>%
+  tidyr::pivot_wider(names_from = timepoint, values_from = n, values_fill = 0)
+print(as.data.frame(avail))
+
+# long form of the same table, used to gate every contrast below
+avail_long <- obj@meta.data %>%
+  distinct(patient_id, condition, timepoint) %>%
+  dplyr::count(condition, timepoint, name = "n_patients") %>%
+  mutate(condition = as.character(condition), timepoint = as.character(timepoint))
+
+usable_tp <- function(cond) {
+  keep <- avail_long %>% filter(condition == cond, n_patients >= MIN_PATIENTS_PER_TP)
+  intersect(TP_LEVELS, keep$timepoint)
+}
+for (cnd in COND_LEVELS)
+  cat("Usable timepoints,", cnd, ":", paste(usable_tp(cnd), collapse = ", "), "\n")
+```
+
+# Per-sample composition
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+meta <- obj@meta.data %>%
+  mutate(cell_label = as.character(.data[[LABEL_COL]])) %>%
+  filter(!cell_label %in% drop_labels,
+         condition %in% COND_LEVELS) %>%
+  as.data.frame()
+
+sample_map <- meta %>%
+  select(sample_origin, patient_id, condition, timepoint) %>%
+  distinct()
+stopifnot(!anyDuplicated(sample_map$sample_origin))
+
+per_sample_counts <- meta %>%
+  dplyr::count(sample_origin, cell_label, name = "n") %>%
+  tidyr::complete(sample_origin, cell_label, fill = list(n = 0)) %>%
+  group_by(sample_origin) %>%
+  mutate(total_cells_sample = sum(n),
+         pct_within_sample  = n / total_cells_sample * 100) %>%
+  ungroup() %>%
+  left_join(sample_map, by = "sample_origin") %>%
+  mutate(timepoint = factor(as.character(timepoint), levels = TP_LEVELS),
+         condition = factor(as.character(condition), levels = COND_LEVELS))
+
+stopifnot(all(abs(
+  tapply(per_sample_counts$pct_within_sample, per_sample_counts$sample_origin, sum) - 100
+) < 1e-8))
+```
+
+```{r}
+contrast_levels <- unlist(lapply(seq_along(TP_LEVELS), function(i)
+  if (i < length(TP_LEVELS)) paste(TP_LEVELS[(i + 1):length(TP_LEVELS)], "-", TP_LEVELS[i])))
+
+order_contrasts <- function(x)
+  factor(as.character(x), levels = intersect(contrast_levels, unique(as.character(x))))
+```
+
+# CLR transform
+
+A block absent from a sample gives a zero, and log(0) is -Inf, which would poison every
+model that sample enters. Zeros are replaced multiplicatively with half the smallest
+observed non-zero proportion in that same sample, which is the standard compositional
+treatment, and the count is reported so the scale of the correction stays visible. The
+row is then reclosed to 100; CLR is invariant to closure so this changes nothing, it
+only keeps the input table readable.
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+clr_df <- per_sample_counts %>%
+  select(sample_origin, condition, timepoint, patient_id, cell_label, pct_within_sample) %>%
+  tidyr::pivot_wider(names_from = cell_label, values_from = pct_within_sample, values_fill = 0)
+
+clr_input <- as.matrix(clr_df %>% select(-sample_origin, -condition, -timepoint, -patient_id))
+rownames(clr_input) <- clr_df$sample_origin
+
+n_zero <- sum(clr_input == 0)
+cat("Structural zeros in the sample x cluster table:", n_zero, "of", length(clr_input), "\n")
+
+if (n_zero > 0) {
+  for (i in seq_len(nrow(clr_input))) {
+    row_i <- clr_input[i, ]
+    if (any(row_i == 0)) {
+      repl <- min(row_i[row_i > 0]) / 2
+      row_i[row_i == 0] <- repl
+      clr_input[i, ] <- row_i / sum(row_i) * 100
+    }
+  }
+  cat("Zeros replaced with half the smallest non-zero proportion of their own sample\n")
+}
+stopifnot(all(clr_input > 0))
+
+clr_mat <- clr(clr_input)
+
+# as.data.frame() on a matrix runs make.names() on the columns, which would turn
+# "CD4/CD8-amb Exhausted/Act" into "CD4.CD8.amb.Exhausted.Act" and silently break every
+# join back to the label set. as_tibble with minimal repair keeps the names verbatim.
+clr_tab <- as.matrix(clr_mat)
+colnames(clr_tab) <- colnames(clr_input)
+stopifnot(all(is.finite(clr_tab)))
+
+clr_long <- tibble::as_tibble(clr_tab, .name_repair = "minimal") %>%
+  mutate(sample_origin = clr_df$sample_origin,
+         condition     = as.character(clr_df$condition),
+         timepoint     = as.character(clr_df$timepoint),
+         patient_id    = as.character(clr_df$patient_id)) %>%
+  tidyr::pivot_longer(cols = -c(sample_origin, condition, timepoint, patient_id),
+                      names_to = "cluster", values_to = "clr_value")
+
+stopifnot(setequal(unique(clr_long$cluster), unique(per_sample_counts$cell_label)))
+# CLR is centred: every sample's values sum to zero
+stopifnot(all(abs(tapply(clr_long$clr_value, clr_long$sample_origin, sum)) < 1e-8))
+```
+
+# Within condition, across timepoints
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+fit_within <- function(dat) {
+  dat$timepoint <- droplevels(factor(dat$timepoint, levels = TP_LEVELS))
+  use_mixed <- any(table(dat$patient_id) > 1) && dplyr::n_distinct(dat$patient_id) >= 3
+  f <- if (use_mixed) lmerTest::lmer(clr_value ~ timepoint + (1 | patient_id), data = dat)
+       else           lm(clr_value ~ timepoint, data = dat)
+  list(fit = f, model = if (use_mixed) "lmer" else "lm")
+}
+
+anova_p_of <- function(fit, term) {
+  tab <- suppressMessages(anova(fit))
+  col <- intersect(c("Pr(>F)", "Pr(>Chisq)"), colnames(tab))
+  if (!length(col) || !(term %in% rownames(tab))) return(NA_real_)
+  tab[term, col[1]]
+}
+
+# timepoints with too few patients are dropped before fitting, not after, so they cannot
+# inflate the residual df or produce contrasts that lean on a single sample
+clr_within <- function(cond) {
+  keep_tp <- usable_tp(cond)
+  clr_long %>% filter(condition == cond, timepoint %in% keep_tp)
+}
+
+n_per_tp <- function(cond) {
+  avail_long %>% filter(condition == cond) %>% select(timepoint, n_patients)
+}
+
+run_means_within <- function(cond) {
+  clr_within(cond) %>%
+    split(.$cluster) %>%
+    imap_dfr(~{
+      m  <- suppressMessages(fit_within(.x))
+      em <- emmeans(m$fit, ~ timepoint, infer = TRUE)
+      as.data.frame(em) %>%
+        mutate(cluster   = .y,
+               anova_p   = anova_p_of(m$fit, "timepoint"),
+               model     = m$model,
+               condition = cond)
+    }) %>%
+    left_join(n_per_tp(cond), by = "timepoint")
+}
+
+run_within <- function(cond) {
+  np <- n_per_tp(cond)
+  clr_within(cond) %>%
+    split(.$cluster) %>%
+    imap_dfr(~{
+      m  <- suppressMessages(fit_within(.x))
+      em <- emmeans(m$fit, ~ timepoint)
+      as.data.frame(contrast(em, method = "revpairwise", adjust = "none", infer = TRUE)) %>%
+        mutate(cluster = .y, model = m$model, condition = cond,
+               anova_p = anova_p_of(m$fit, "timepoint"))
+    }) %>%
+    group_by(cluster) %>%
+    mutate(p.adjust = p.adjust(p.value, method = "BH")) %>%   # BH over the pairs, per cluster
+    ungroup() %>%
+    mutate(tp_later   = sub(" - .*$", "", contrast),
+           tp_earlier = sub("^.* - ", "", contrast)) %>%
+    left_join(np %>% rename(tp_later = timepoint,   n_later   = n_patients), by = "tp_later") %>%
+    left_join(np %>% rename(tp_earlier = timepoint, n_earlier = n_patients), by = "tp_earlier") %>%
+    mutate(signif = case_when(p.adjust < 0.001 ~ "***",
+                              p.adjust < 0.01  ~ "**",
+                              p.adjust < 0.05  ~ "*",
+                              TRUE ~ ""),
+           est_label = sprintf("%+.2f%s", estimate, signif),
+           contrast  = order_contrasts(contrast)) %>%
+    arrange(contrast, cluster)
+}
+
+means_within_ctrl <- run_means_within("CTRL")
+means_within_case   <- run_means_within("CASE")
+within_ctrl <- run_within("CTRL")
+within_case   <- run_within("CASE")
+```
+
+# Between conditions, per timepoint
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+# a timepoint is only comparable if both conditions clear MIN_PATIENTS_PER_TP there
+tp_both <- intersect(usable_tp("CTRL"), usable_tp("CASE"))
+cat("Timepoints comparable between conditions:", paste(tp_both, collapse = ", "), "\n")
+
+fit_between <- function(dat) {
+  if (dplyr::n_distinct(dat$condition) < 2) return(NULL)
+  f  <- lm(clr_value ~ condition, data = dat)
+  em <- emmeans(f, ~ condition)
+  as.data.frame(contrast(em, method = "revpairwise", adjust = "none", infer = TRUE)) %>%
+    mutate(cluster   = as.character(dat$cluster)[1],
+           timepoint = as.character(dat$timepoint)[1],
+           n_CTRL    = sum(dat$condition == "CTRL"),
+           n_CASE      = sum(dat$condition == "CASE"))
+}
+
+between_tp <- clr_long %>%
+  filter(timepoint %in% tp_both) %>%
+  split(list(.$cluster, .$timepoint), drop = TRUE) %>%
+  map_dfr(fit_between) %>%
+  group_by(cluster) %>%
+  mutate(p.adjust = p.adjust(p.value, method = "BH")) %>%   # BH over timepoints, per cluster
+  ungroup() %>%
+  mutate(signif = case_when(p.adjust < 0.001 ~ "***",
+                            p.adjust < 0.01  ~ "**",
+                            p.adjust < 0.05  ~ "*",
+                            TRUE ~ ""),
+         est_label = sprintf("%+.2f%s", estimate, signif),
+         timepoint = factor(timepoint, levels = TP_LEVELS)) %>%
+  arrange(timepoint, cluster)
+```
+
+# Save
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+write_block <- function(wb, sheet, title, df, start_row) {
+  if (!(sheet %in% names(wb))) addWorksheet(wb, sheet)
+  writeData(wb, sheet, title, startRow = start_row, startCol = 1)
+  addStyle(wb, sheet, createStyle(textDecoration = "bold", fontSize = 12),
+           rows = start_row, cols = 1)
+  mergeCells(wb, sheet, cols = 1:ncol(df), rows = start_row)
+  writeData(wb, sheet, as.data.frame(df), startRow = start_row + 1, startCol = 1,
+            headerStyle = createStyle(textDecoration = "bold", border = "bottom"))
+  setColWidths(wb, sheet, cols = 1:ncol(df), widths = "auto")
+  start_row + nrow(df) + 4
+}
+
+within_ctrl_t0 <- within_ctrl %>% filter(grepl("- T0$", contrast))
+within_case_t0   <- within_case   %>% filter(grepl("- T0$", contrast))
+
+wb <- createWorkbook()
+r <- write_block(wb, "within_CTRL", "Within CTRL: CLR timepoint comparison, T0 as reference", within_ctrl_t0, 1)
+r <- write_block(wb, "within_CTRL", "Within CTRL: CLR timepoint comparison, all pairwise timepoints", within_ctrl, r)
+r <- write_block(wb, "within_CASE",   "Within CASE: CLR timepoint comparison, T0 as reference", within_case_t0, 1)
+r <- write_block(wb, "within_CASE",   "Within CASE: CLR timepoint comparison, all pairwise timepoints", within_case, r)
+r <- write_block(wb, "CASE_vs_CTRL_by_tp", "CASE vs CTRL: CLR comparison at each timepoint", between_tp, 1)
+r <- write_block(wb, "means", "Estimated marginal CLR means, within CTRL", means_within_ctrl, 1)
+r <- write_block(wb, "means", "Estimated marginal CLR means, within CASE", means_within_case, r)
+r <- write_block(wb, "availability", "Subjects per condition and timepoint", avail, 1)
+saveWorkbook(wb, file.path(csv_dir, paste0(FILE_PREFIX, "_CLR_timepoint.xlsx")),
+             overwrite = TRUE)
+```
+
+# Forest plots
+
+```{r}
+tp_cols <- c("T0" = "purple1", "T1" = "#4C78A8", "T2" = "#F58518",
+             "T3" = "#54A24B", "T4" = "#D4494E")
+
+forest_theme <- theme_minimal() +
+  theme(strip.text        = element_text(size = 5, color = "black"),
+        panel.spacing     = unit(0.4, "lines"),
+        panel.spacing.y   = unit(0, "lines"),
+        plot.margin       = margin(5, 5, 5, 5),
+        axis.text.y       = element_text(size = 5, color = "black"),
+        axis.text.x       = element_text(size = 5, angle = 45, hjust = 1, color = "black"),
+        axis.title.x      = element_text(size = 6, color = "black"),
+        axis.title.y      = element_text(size = 6, color = "black"),
+        axis.ticks        = element_line(color = "black"),
+        axis.ticks.length = unit(0.15, "cm"),
+        plot.title        = element_text(size = 6),
+        legend.position   = "bottom",
+        legend.key.size   = unit(0.4, "cm"),
+        legend.text       = element_text(size = 4),
+        legend.title      = element_text(size = 4.5),
+        panel.grid.major  = element_blank(),
+        panel.grid.minor  = element_blank())
+
+forest_base <- function(d, colour_var) {
+  ggplot(d, aes(x = estimate, y = cluster, color = .data[[colour_var]])) +
+    geom_errorbar(aes(xmin = lower.CL, xmax = upper.CL),
+                  position = position_dodge(width = 0.55), height = 0.2) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_point(position = position_dodge(width = 0.55), size = 2) +
+    geom_text(aes(x = upper.CL + 0.25, label = est_label, group = .data[[colour_var]]),
+              position = position_dodge(width = 0.55), vjust = 0.3, size = 1.8,
+              color = "black", show.legend = FALSE) +
+    scale_y_discrete(expand = expansion(mult = c(0.001, 0.001))) +
+    scale_x_continuous(breaks = seq(-100, 100, by = 1)) +
+    coord_cartesian(clip = "off")
+}
+
+order_clusters <- function(d)
+  mutate(d, cluster = factor(as.character(cluster),
+                             levels = rev(sort(unique(as.character(cluster))))))
+```
+
+## Relative to T0, within condition
+
+```{r, fig.width = 14}
+plots_t0 <- list()
+for (cnd in COND_LEVELS) {
+  d <- (if (cnd == "CTRL") within_ctrl_t0 else within_case_t0) %>%
+    order_clusters() %>%
+    mutate(timepoint = factor(sub(" - T0$", "", as.character(contrast)), levels = TP_LEVELS)) %>%
+    filter(!is.na(timepoint))
+  if (!nrow(d)) next
+  p <- forest_base(d, "timepoint") +
+    scale_color_manual(values = tp_cols) +
+    labs(x = "CLR difference relative to T0", y = "Clusters", color = "Timepoint",
+         title = paste0(SUBSET_TITLE, " (", cnd, "): All timepoint changes from T0")) +
+    forest_theme + theme(axis.line = element_line(color = "black"))
+  
+  plots_t0[[cnd]] <- p
+  print(p)
+}
+```
+
+## All pairwise timepoints, within condition
+
+```{r, fig.width = 14}
+plots_pairwise <- list()
+for (cnd in COND_LEVELS) {
+  d <- (if (cnd == "CTRL") within_ctrl else within_case) %>% order_clusters()
+  if (!nrow(d)) next
+  p <- forest_base(d, "contrast") +
+    labs(x = "CLR difference for later timepoint compared to earlier", y = "Clusters",
+         title = paste0(SUBSET_TITLE, " (", cnd, "): all pairwise timepoint contrasts")) +
+    facet_wrap(~ contrast, ncol = 3) +
+    forest_theme +
+    theme(legend.position = "none",
+          panel.border = element_rect(color = "black", fill = NA, linewidth = 0.3),
+          axis.line = element_blank())
+  
+  plots_pairwise[[cnd]] <- p
+  print(p)
+}
+```
+
+## CASE vs CTRL, per timepoint
+
+```{r, fig.width = 14}
+d <- between_tp %>% order_clusters() %>% mutate(timepoint = droplevels(timepoint))
+p_between <- forest_base(d, "timepoint") +
+  scale_color_manual(values = tp_cols) +
+  labs(x = "CLR difference for CASE relative to CTRL", y = "Clusters",
+       title = paste0(SUBSET_TITLE, ": CASE vs CTRL at each timepoint")) +
+  facet_wrap(~ timepoint, nrow = 1) +
+  forest_theme +
+  theme(legend.position = "none",
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.3),
+        axis.line = element_blank())
+
+print(p_between)
+```

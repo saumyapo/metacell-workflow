@@ -1,0 +1,1413 @@
+---
+title: "10 Clonal repertoire (TCR)"
+author: "Saumya Pothukuchi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: cosmo
+    code_folding: hide
+---
+
+<!--
+Structure follows the rnabio.org TCR workflow. Attaches the repertoire and the
+external flag, produces the descriptive tables and figures, writes one workbook
+and one RDS. Diversity, tracking, Startrac and the test families are in 11,
+which reads that RDS.
+
+Figure conventions, applied throughout:
+  - one palette, defined once in the config chunk
+  - sample-wise axes rotated 45 degrees
+  - sample-wise comparisons facetted by condition
+  - clone size on a sequential ramp (ordinal), cell state on the categorical
+    palette, condition on its own two colours
+
+Several distribution figures are rebuilt from the scRepertoire export tables
+rather than printed from scRepertoire directly, because the returned ggplot
+carries no `condition` column and cannot be facetted without editing the
+object. Same numbers, controllable figure.
+
+Clone calling, bin scales and chain dropout: docs/12_clonal.md.
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+options(width = 60)
+```
+
+```{r libs, results = FALSE}
+library(dplyr)
+library(tidyr)
+library(Seurat)
+library(scRepertoire)
+library(ggplot2)
+library(patchwork)
+library(openxlsx)
+library(ggridges)
+
+stopifnot(packageVersion("scRepertoire") >= "2.0.0")
+```
+
+R: `r R.Version()$version.string`,
+Seurat: `r packageVersion('Seurat')`,
+scRepertoire: `r packageVersion('scRepertoire')`
+
+# Configuration
+
+```{r config, results = FALSE}
+# Paths, factor levels and palettes come from config/config.R.
+source(file.path("..", "config", "config.R"))
+
+SUBSET_SLUG  <- "subset"
+FILE_PREFIX  <- "subset_data"
+STATE_COL    <- "mc_state"     # optional finer state column, if 05 wrote one
+SUBSET_TITLE <- "Subset"
+VDJ_KIND     <- "vdj_t"        # "vdj_b" for BCR, everything else is unchanged
+
+# the annotated object written by 05
+rds_path   <- file.path(DIR_RDS, SUBSET_SLUG, "metacell",
+                        paste0(FILE_PREFIX, "_MC_annotated.RDS"))
+clone_root <- file.path(out_dirs(SUBSET_SLUG, "csv"), "clonal")
+fig_dir    <- file.path(out_dirs(SUBSET_SLUG, "pdf"), "clonal")
+for (d in c(clone_root, fig_dir)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+# "strict" is V/J gene plus the nucleotide CDR3 on both chains. The most
+# conservative call scRepertoire offers, and the right default within a patient:
+# two cells only share a clone if their receptors are identical at nucleotide level.
+CLONE_CALL <- "strict"
+
+# Count bins. Tuned to PBMC, where a 20-cell clone is already large. Prefer the
+# occurrence bins below for anything compared across samples of different depth.
+FREQ_BINS   <- c(0, 1, 2, 5, 20, Inf)
+FREQ_LABELS <- c("count 1", "count 2", "count 3-5", "count 6-20", "count >20")
+
+set.seed(123)
+
+# Cell Ranger V(D)J tree and the library-to-sample map, both from config/
+VDJ_RAW_DIR <- file.path(PROJ, "data", "vdj")
+VDJ_BATCHES <- c("batch1", "batch2", "batch3", "batch4")
+
+# library folder token -> sample id. Library naming is rarely derivable from the
+# sample id by pattern, so the mapping is written out explicitly in a csv and
+# read here rather than hardcoded.
+vdj_map <- read.csv(file.path(PROJ, "config", "vdj_library_map.csv"),
+                    stringsAsFactors = FALSE)
+VDJ_TOKEN_TO_SAMPLE <- setNames(vdj_map$sample_origin, vdj_map$library_token)
+```
+
+## Palette and theme
+
+One place to change every figure in both notebooks.
+
+The clone-size ramp is taken from Mhanna et al., *Cell Rep Methods* 2024,
+Fig 1C: cool blues for rare clonotypes, then cream, orange and red as occurrence
+rises. It reads better than a single-hue ramp because the warm end is where the
+biology is, and it is ordinal so it needs no legend lookup to interpret. Every
+ordered clone-size scale in both notebooks uses it.
+
+Condition colours follow the Nature Medicine house style in three of the four
+papers: a steel blue and a brick red, used consistently and never swapped.
+
+```{r palette, results = FALSE}
+PAL_COND  <- c(CTRL = "#4C7FB8", CASE = "#A02C2C")   # steel blue / brick red
+PAL_TP    <- c(T0 = "#D9D9D9", T1 = "#A6BDDB", T2 = "#67A9CF",
+               T3 = "#3690C0", T4 = "#02648A")     # ordered, light to dark
+PAL_FLAG   <- c(`FALSE` = "#C9CCD1", `TRUE` = "#A02C2C")
+
+# Expanded / Unique, the >=2-cell dichotomy both Nature Medicine papers lead with
+PAL_CLONAL <- c(Unique = "#4FBF6E", Expanded = "#3F4E8C")
+
+# ordinal ramp for clone size: cool = rare, warm = expanded (Cell Rep Methods Fig 1C).
+# The cool end is darker than Fig 1C's: at bar-slice size the near-white blues
+# were invisible and read as empty legend keys.
+PAL_SEQ <- c("#BBD7EA", "#7FB2D4", "#3D7FB0", "#FBD277", "#EE8B3C", "#B62B2B")
+
+# categorical, for cell states. Muted, prints well, 12 before it recycles.
+PAL_CAT <- c("#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3", "#937860",
+             "#DA8BC3", "#8C8C8C", "#CCB974", "#64B5CD", "#4A6FE3", "#A0522D")
+
+# occurrence breaks, verbatim from Cell Rep Methods Fig 1C. A clonotype is
+# binned by the percentage of the repertoire it occupies, not by cell count, so
+# samples of different depth are directly comparable.
+OCC_BREAKS <- c(0, 1e-4, 1e-3, 1e-2, 1e-1, 1, 100)
+OCC_LABELS <- c("(0,1e-04]", "(1e-04,0.001]", "(0.001,0.01]",
+                "(0.01,0.1]", "(0.1,1]", "(1,100]")
+PAL_OCC    <- setNames(PAL_SEQ, OCC_LABELS)
+
+# map a sequential ramp onto however many levels a factor actually has.
+# scRepertoire names cloneSize levels things like "Rare (0 < X <= 1e-04)", so
+# they are matched positionally rather than by name.
+# rev = TRUE when the factor's levels run largest-first, so the warm end of the
+# ramp always lands on the most expanded level whichever way the levels are ordered.
+seq_pal <- function(x, rev = FALSE) {
+  lv <- if (is.factor(x)) levels(droplevels(x)) else sort(unique(x[!is.na(x)]))
+  cols <- grDevices::colorRampPalette(PAL_SEQ)(length(lv))
+  if (rev) cols <- rev(cols)
+  setNames(cols, lv)
+}
+cat_pal <- function(x) {
+  lv <- if (is.factor(x)) levels(droplevels(x)) else sort(unique(x[!is.na(x)]))
+  setNames(rep(PAL_CAT, length.out = length(lv)), lv)
+}
+
+theme_tcr <- function(base_size = 11) {
+  theme_bw(base_size) +
+    theme(panel.grid.minor  = element_blank(),
+          panel.grid.major.x = element_blank(),
+          panel.border      = element_rect(colour = "grey35", linewidth = 0.5),
+          strip.background  = element_rect(fill = "grey92", colour = "grey35"),
+          strip.text        = element_text(face = "bold", size = rel(0.85)),
+          axis.text.x       = element_text(angle = 45, hjust = 1, vjust = 1),
+          legend.key.size   = unit(0.4, "cm"),
+          plot.title        = element_text(face = "bold", size = rel(1.0)),
+          plot.subtitle     = element_text(colour = "grey30", size = rel(0.85)))
+}
+
+# CTRL and CASE in their own boxes, each only as wide as its own sample count
+facet_cond <- function(...) facet_grid(..., scales = "free_x", space = "free_x")
+```
+
+# Load the annotated object
+
+```{r load, results = FALSE}
+obj <- readRDS(rds_path)
+obj <- JoinLayers(obj)
+
+stopifnot(LABEL_COL %in% colnames(obj@meta.data))
+stopifnot(all(c("category", "category_plot") %in% colnames(obj@meta.data)))
+
+obj$patient_id    <- as.character(obj$patient_id)
+obj$sample_origin <- as.character(obj$sample_origin)
+obj$condition     <- factor(as.character(obj$condition), levels = COND_LEVELS)
+obj$timepoint     <- factor(as.character(obj$timepoint), levels = TP_LEVELS)
+obj$cell_label    <- as.character(obj@meta.data[[LABEL_COL]])
+if (STATE_COL %in% colnames(obj@meta.data))
+  obj$cell_state <- as.character(obj@meta.data[[STATE_COL]])
+
+CAT_LEVELS     <- levels(factor(obj$category))
+CATPLOT_LEVELS <- levels(factor(obj$category_plot))
+obj$category      <- factor(as.character(obj$category),      levels = CAT_LEVELS)
+obj$category_plot <- factor(as.character(obj$category_plot),  levels = CATPLOT_LEVELS)
+
+# StartracDiversity (stats notebook) reads Idents(). Left unset it reports
+# majorCluster = "SeuratProject" and tran = 0 everywhere.
+Idents(obj) <- factor(obj$cell_label)
+stopifnot(!anyNA(obj$condition), !anyNA(obj$timepoint), !anyNA(obj$category_plot))
+```
+
+```{r load-report}
+cat("Cells in object:", ncol(obj), "\n")
+print(table(obj$condition, obj$timepoint))
+
+sample_meta <- obj@meta.data %>%
+  distinct(sample_origin, category_plot, category, patient_id, condition, timepoint) %>%
+  arrange(category_plot)
+stopifnot(!anyDuplicated(sample_meta$sample_origin))
+sampleNames <- sample_meta$sample_origin
+```
+
+# Normalisation and UMAP
+
+`DimPlot(obj, group.by = "cloneSize")` failed with *Unable to find a DimReduc
+matching one of 'umap', 'tsne', or 'pca'*, and `clonalNetwork(reduction = "umap")`
+was failing for the same reason and being swallowed by `safe()`.
+
+There is no embedding anywhere in this project to carry over. MC2 ran directly on
+the merged object, cells were subset on the global block annotations, and MC2 ran
+again on the subset; the blocks come from ComplexHeatmap column k-means, so no
+step ever needed one. So it is computed here, on this object.
+
+Worth knowing when reading the panels: this embedding is independent of the
+metacell blocks. `cluster_label` comes from the module heatmap, not from these
+coordinates, so the labels will not necessarily form clean islands, and where
+they disagree the heatmap is the annotation of record.
+
+```{r normalise-umap}
+obj <- NormalizeData(obj, verbose = FALSE)
+obj <- FindVariableFeatures(obj, nfeatures = 2000, verbose = FALSE)
+obj <- ScaleData(obj, verbose = FALSE)
+obj <- RunPCA(obj, npcs = 30, verbose = FALSE)
+ElbowPlot(obj, reduction = "pca", ndims = 50)
+
+obj <- RunUMAP(obj, dims = 1:30, verbose = FALSE)
+```
+
+# Locate the contig files
+
+```{r locate}
+vdj_paths <- unlist(lapply(VDJ_BATCHES, function(b)
+  Sys.glob(file.path(VDJ_RAW_DIR, b, "cellranger_output", "*", "per_sample_outs", "*",
+                     VDJ_KIND, "filtered_contig_annotations.csv"))))
+
+# token match, the same map 01 uses. Visit numbering is not derivable by pattern.
+vdj_path_of <- list()
+for (p in vdj_paths) {
+  hits <- VDJ_TOKEN_TO_SAMPLE[vapply(names(VDJ_TOKEN_TO_SAMPLE),
+                                     function(tk) grepl(tk, p, fixed = TRUE), logical(1))]
+  if (length(hits) == 1) vdj_path_of[[unname(hits)]] <- c(vdj_path_of[[unname(hits)]], p)
+}
+if (length(names(vdj_path_of)[lengths(vdj_path_of) > 1]))
+  stop("more than one ", VDJ_KIND, " file matched a sample token")
+
+vdj_samples <- intersect(sampleNames, names(vdj_path_of))
+missing_vdj <- setdiff(sampleNames, names(vdj_path_of))
+cat("Files found:", length(vdj_paths), "| samples resolved:",
+    length(vdj_samples), "of", length(sampleNames), "\n")
+if (length(missing_vdj)) cat("WARNING no", VDJ_KIND, "for:",
+                             paste(missing_vdj, collapse = ", "), "\n")
+stopifnot(length(vdj_samples) > 0)
+
+# the token map errors if one token matches two files, but not if a token
+# matches the WRONG file. Printing the resolved table is the only way to catch
+# that. batch feeds the public-clone check in the stats notebook.
+path_map <- data.frame(
+  sample_origin = vdj_samples,
+  contig_path   = vapply(vdj_samples, function(s) vdj_path_of[[s]][1], character(1),
+                         USE.NAMES = FALSE), stringsAsFactors = FALSE) %>%
+  mutate(batch = sub("/.*$", "", sub(paste0("^", VDJ_RAW_DIR, "/"), "", contig_path))) %>%
+  left_join(sample_meta, by = "sample_origin") %>%
+  dplyr::select(category_plot, sample_origin, patient_id, condition, timepoint,
+                batch, contig_path) %>%
+  arrange(category_plot)
+print(as.data.frame(path_map %>% dplyr::select(-contig_path)))
+
+sample_meta <- sample_meta %>%
+  left_join(path_map %>% dplyr::select(sample_origin, batch), by = "sample_origin")
+obj$batch <- sample_meta$batch[match(obj$sample_origin, sample_meta$sample_origin)]
+```
+
+# Combine contigs
+
+```{r combine}
+# Not filtering contigs on productive/is_cell again: 01 preprocessing already
+# did doublet filtering based on TCR-B.
+contig_list <- lapply(vdj_samples, function(s)
+  read.csv(vdj_path_of[[s]][1], stringsAsFactors = FALSE))
+names(contig_list) <- vdj_samples
+
+contig_list <- lapply(contig_list, function(df) {
+  for (cl in c("productive", "is_cell", "high_confidence", "full_length"))
+    if (cl %in% names(df)) df[[cl]] <- as.logical(toupper(df[[cl]]))
+  df$sample <- NULL
+  df
+})
+
+# filterMulti keeps the highest-UMI contig per chain rather than discarding the
+# barcode, which is the right call after the 01 dual-TRB doublet filter.
+# removeNA = FALSE keeps single-chain barcodes: they are still clones.
+combined <- combineTCR(contig_list,
+                       samples     = vdj_samples,
+                       removeNA    = FALSE,
+                       removeMulti = FALSE,
+                       filterMulti = TRUE)
+
+# combineTCR writes barcodes as SAMPLE_BARCODE. 01 wrote cell names as BARCODE_SAMPLE.
+combined <- lapply(combined, function(d) {
+  d$barcode <- sub("^(.*?)_(.*)$", "\\2_\\1", d$barcode); d
+})
+names(combined) <- vdj_samples
+```
+
+# Filter contigs to cells present in the object
+
+From the rnabio workflow. Contig files contain barcodes that
+never reached this object: cells that failed RNA QC, called doublets, and cells
+that landed in another lineage subset. Left in, every repertoire summary
+describes the raw contig file rather than the T cells being analysed, and the
+clone-size denominators stop agreeing with the QC table.
+
+Filtering here rather than only inside `combineExpression` gives one denominator
+everywhere. `clonalFrequency` and `cloneSize` shift slightly against the
+unfiltered run; that is the intended effect.
+
+```{r filter-to-object}
+in_obj <- split(colnames(obj), obj$sample_origin)
+
+pre_n    <- vapply(combined, nrow, integer(1))
+combined <- lapply(vdj_samples, function(s)
+  combined[[s]][combined[[s]]$barcode %in% in_obj[[s]], , drop = FALSE])
+names(combined) <- vdj_samples
+
+# a sample losing every barcode means the reformat above is wrong, not that VDJ failed
+keep <- vapply(combined, nrow, integer(1)) > 0
+if (any(!keep)) cat("dropping samples with no matching barcode:",
+                    paste(names(keep)[!keep], collapse = ", "), "\n")
+combined    <- combined[keep]
+vdj_samples <- names(combined)
+stopifnot(length(vdj_samples) > 0)
+
+post_n <- vapply(combined, nrow, integer(1))
+cat(sprintf("Contig barcodes: %d before filter, %d after (%.1f%% retained)\n",
+            sum(pre_n), sum(post_n), 100 * sum(post_n) / sum(pre_n)))
+```
+
+```{r vdj-qc}
+## TCR matching is never 100%: 10x VDJ recovery is 75-90%, low-TCR-mRNA cells
+## fail contig assembly, and NK / innate-like cells make no productive TCR reads.
+vdj_qc <- bind_rows(lapply(vdj_samples, function(s) {
+  d <- combined[[s]]
+  data.frame(sample_origin     = s,
+             n_cells_subset    = length(in_obj[[s]]),
+             n_contigs_pre     = unname(pre_n[s]),
+             n_cells_with_vdj  = nrow(d),
+             vdj_recovery_pct  = round(100 * nrow(d) / max(length(in_obj[[s]]), 1), 2),
+             n_paired          = sum(!is.na(d$TCR1) & !is.na(d$TCR2)),
+             paired_pct_of_vdj = round(100 * mean(!is.na(d$TCR1) & !is.na(d$TCR2)), 2),
+             stringsAsFactors  = FALSE)
+})) %>%
+  left_join(sample_meta, by = "sample_origin") %>%
+  dplyr::select(category_plot, sample_origin, patient_id, condition, timepoint,
+                batch, everything()) %>%
+  arrange(category_plot)
+
+stopifnot(all(vdj_qc$n_paired <= vdj_qc$n_cells_with_vdj))
+print(as.data.frame(vdj_qc %>% dplyr::select(-sample_origin, -patient_id)))
+```
+
+```{r label-copy}
+# scRepertoire labels its plots and export tables with the names of this list.
+# combineExpression matches on barcode and is run on `combined`; everything the
+# reader sees is run on this copy, so every figure comes out labelled CASE3_T0.
+cat_of  <- setNames(as.character(sample_meta$category_plot), sample_meta$sample_origin)
+orig_of <- setNames(sample_meta$sample_origin, as.character(sample_meta$category_plot))
+combined_lab <- combined
+names(combined_lab) <- unname(cat_of[names(combined)])
+combined_lab <- combined_lab[order(factor(names(combined_lab), levels = CATPLOT_LEVELS))]
+stopifnot(!anyNA(names(combined_lab)))
+
+# scRepertoire export tables carry the list name in whichever column it chose.
+# Find it and add sample_origin so the table still joins to everything else.
+add_origin <- function(d) {
+  d <- as.data.frame(d)
+  if (!"category_plot" %in% names(d) && !is.null(rownames(d)) &&
+      all(rownames(d) %in% names(orig_of))) d$category_plot <- rownames(d)
+  if (!"category_plot" %in% names(d)) {
+    hit <- names(d)[vapply(d, function(v) is.character(v) || is.factor(v), logical(1))]
+    hit <- hit[vapply(hit, function(cn)
+      mean(as.character(d[[cn]]) %in% names(orig_of)) > 0.9, logical(1))]
+    if (length(hit)) names(d)[names(d) == hit[1]] <- "category_plot"
+  }
+  if ("category_plot" %in% names(d))
+    d$sample_origin <- unname(orig_of[as.character(d$category_plot)])
+  rownames(d) <- NULL
+  d
+}
+```
+
+# Attach the repertoire to the object
+
+`group.by = "none"` computes clone frequency inside each sample, which is what a
+timepoint-level expansion statement needs. Patient-level frequency is added
+separately below.
+
+Bins stay on the proportion scale. rnabio uses `proportion = FALSE` with counts
+`Single=1, Small=5, Medium=20, Large=100, Hyperexpanded=500`; see the note at
+the end of this file for why that does not transfer to PBMC.
+
+```{r combine-expression}
+obj <- combineExpression(combined, obj,
+                         cloneCall  = CLONE_CALL,
+                         chain      = "both",
+                         group.by   = "none",
+                         proportion = TRUE,
+                         cloneSize  = c(Rare = 1e-4, Small = 0.001, Medium = 0.01,
+                                        Large = 0.1, Hyperexpanded = 1),
+                         filterNA   = FALSE)
+
+obj$has_vdj <- !is.na(obj$CTstrict)
+obj$has_tcr <- obj$has_vdj
+
+# verify the group.by = "none" claim rather than trusting the comment
+.chk <- obj@meta.data %>% filter(!is.na(CTstrict)) %>%
+  dplyr::count(sample_origin, CTstrict, name = "n_in_sample") %>%
+  left_join(obj@meta.data %>% filter(!is.na(CTstrict)) %>%
+              distinct(sample_origin, CTstrict, clonalFrequency),
+            by = c("sample_origin", "CTstrict"))
+cat("clonalFrequency is per-sample:", all(.chk$n_in_sample == .chk$clonalFrequency), "\n")
+
+obj$count_bin <- factor(as.character(cut(obj$clonalFrequency, breaks = FREQ_BINS,
+                                         labels = FREQ_LABELS, right = TRUE)),
+                        levels = FREQ_LABELS)
+obj$count_bin[!obj$has_vdj] <- NA
+
+# The >=2-cell dichotomy. Both Nature Medicine papers lead with this rather than
+# with binned clone sizes, and it is the one clone-size statement that involves
+# no arbitrary cutoff at all: a clone is either seen once or more than once.
+obj$expanded      <- obj$has_vdj & obj$clonalFrequency > 1
+obj$clonal_status <- factor(ifelse(!obj$has_vdj, NA_character_,
+                                   ifelse(obj$expanded, "Expanded", "Unique")),
+                            levels = c("Unique", "Expanded"))
+
+# occurrence bin: the clone's share of its own sample's repertoire, as a percent.
+# Cell Rep Methods Fig 1C. Depth-independent by construction.
+obj$occ_pct <- 100 * obj$clonalProportion
+obj$occ_bin <- cut(obj$occ_pct, breaks = OCC_BREAKS, labels = OCC_LABELS,
+                   include.lowest = TRUE, right = TRUE)
+
+# patient-level frequency, the denominator for anything tracking a clone across visits
+md <- obj@meta.data
+pat_freq <- md %>% filter(!is.na(CTstrict)) %>%
+  dplyr::count(patient_id, CTstrict, name = "patient_clone_n") %>%
+  group_by(patient_id) %>%
+  mutate(patient_clone_prop = patient_clone_n / sum(patient_clone_n)) %>% ungroup()
+idx <- match(paste(md$patient_id, md$CTstrict),
+             paste(pat_freq$patient_id, pat_freq$CTstrict))
+obj$patient_clone_n    <- pat_freq$patient_clone_n[idx]
+obj$patient_clone_prop <- pat_freq$patient_clone_prop[idx]
+obj$patient_count_bin  <- factor(as.character(cut(obj$patient_clone_n, breaks = FREQ_BINS,
+                                                  labels = FREQ_LABELS, right = TRUE)),
+                                 levels = FREQ_LABELS)
+obj$patient_count_bin[!obj$has_vdj] <- NA
+
+cat("Cells with a TCR:", sum(obj$has_vdj), "of", ncol(obj),
+    sprintf("(%.1f%%)\n", 100 * mean(obj$has_vdj)))
+print(table(obj$cloneSize, useNA = "ifany"))
+print(table(obj$count_bin, useNA = "ifany"))
+```
+
+## Chain dropout, and a beta-only clone id
+
+`CTstrict` concatenates both chains, so a cell that lost its alpha chain gets a
+different string from its own sisters and is counted as a separate clone. That
+inflates `n_clones`, deflates the largest clone sizes, biases `clonality`
+downwards and under-detects persistence, at a rate that differs several-fold
+between samples. Measured here and carried as `chain_status` / `clone_trb` so
+the stats notebook can run the sensitivity analysis without re-reading contigs.
+Orphans are not merged into their beta-matched parent: that would invent
+lineage calls the data does not support.
+
+```{r chain-dropout}
+aa_parts  <- strsplit(ifelse(is.na(obj$CTaa), "NA_NA", obj$CTaa), "_", fixed = TRUE)
+has_alpha <- vapply(aa_parts, function(v) length(v) >= 1 && !v[1] %in% c("NA", ""), logical(1))
+has_beta  <- vapply(aa_parts, function(v) length(v) >= 2 && !v[2] %in% c("NA", ""), logical(1))
+obj$chain_status <- ifelse(!obj$has_vdj, NA_character_,
+                    ifelse(has_alpha & has_beta, "paired",
+                    ifelse(has_beta, "beta_only", ifelse(has_alpha, "alpha_only", "unknown"))))
+
+# beta-only clone id: TRBV/TRBJ plus the beta nucleotide CDR3
+trb_map <- bind_rows(lapply(combined, function(d)
+  data.frame(barcode = d$barcode,
+             clone_trb = ifelse(is.na(d$TCR2) | is.na(d$cdr3_nt2), NA_character_,
+                                paste(d$TCR2, d$cdr3_nt2, sep = "_")),
+             stringsAsFactors = FALSE)))
+obj$clone_trb <- trb_map$clone_trb[match(colnames(obj), trb_map$barcode)]
+
+dropout_qc <- obj@meta.data %>%
+  filter(has_vdj) %>%
+  group_by(category_plot, sample_origin) %>%
+  summarise(n_vdj = n(),
+            pct_paired     = round(100 * mean(chain_status == "paired"), 2),
+            pct_beta_only  = round(100 * mean(chain_status == "beta_only"), 2),
+            pct_alpha_only = round(100 * mean(chain_status == "alpha_only"), 2),
+            .groups = "drop") %>%
+  left_join(sample_meta %>% dplyr::select(sample_origin, condition, timepoint, batch),
+            by = "sample_origin") %>%
+  arrange(desc(pct_beta_only))
+print(as.data.frame(dropout_qc))
+```
+
+# external label mapping from the extcalls object
+
+Moved here from the extcalls notebook and written into the RDS below, so
+`flag_pos` travels with the object instead of being re-derived downstream.
+
+```{r flag-transfer}
+cols_to_transfer <- c(
+  "flag_pos", "flag_call", "scGate_multi",
+  "is.pure_A", "is.pure_B",
+  "Tcell_UCell", "CD4Tcell_UCell", "CD8T_UCell",
+  "Talphabeta_UCell", "Tgammadelta_UCell",
+  "Tgd1_UCell", "Tgd2_UCell", "Treg_UCell",
+  "scDblFinder_class", "scDblFinder_score",
+  "KEEP_CELL")
+
+extcalls_data <- readRDS(rds_path)
+cols_present   <- intersect(cols_to_transfer, colnames(extcalls_data@meta.data))
+extcalls_meta <- extcalls_data@meta.data[, cols_present, drop = FALSE]
+rm(extcalls_data); invisible(gc())
+
+# do not overwrite the QC columns already on obj
+for (cl in c("scDblFinder_class", "scDblFinder_score"))
+  if (cl %in% colnames(extcalls_meta))
+    colnames(extcalls_meta)[colnames(extcalls_meta) == cl] <- paste0("extcalls_", cl)
+
+# extcalls barcodes are SAMPLE_BARCODE, ours are BARCODE_SAMPLE
+rownames(extcalls_meta) <- sub("^(.*?)_(.*)$", "\\2_\\1", rownames(extcalls_meta))
+
+as_flag_logical <- function(x) {
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) x <- x %in% c("TRUE", "True", "true", "1")
+  x <- as.logical(x); x[is.na(x)] <- FALSE; x
+}
+extcalls_meta$flag_pos <- as_flag_logical(extcalls_meta$flag_pos)
+```
+
+```{r car-accounting-global}
+n_cert     <- nrow(extcalls_meta)
+flag_bc     <- rownames(extcalls_meta)[extcalls_meta$flag_pos]
+n_flag_ext <- length(flag_bc)
+cat(sprintf("Extcalls cells:                 %d\n", n_cert))
+cat(sprintf("Flag+ in extcalls:               %d (%.2f%% of extcalls)\n",
+            n_flag_ext, 100 * n_flag_ext / n_cert))
+
+# optional: the global annotated object, used only to report where flagged
+# cells landed outside this subset. Skipped with a warning if absent.
+global_path <- file.path(DIR_RDS, "global", "metacell", "global_MC_annotated.RDS")
+if (file.exists(global_path)) {
+  global_md <- readRDS(global_path)@meta.data
+  in_glob   <- intersect(flag_bc, rownames(global_md))
+  cat(sprintf("Flag+ found in global MC object:  %d (%.2f%% of Flag+)\n",
+              length(in_glob), 100 * length(in_glob) / n_flag_ext))
+  flag_broad <- as.data.frame(table(broad_label = global_md[in_glob, "broad_label"]),
+                             responseName = "n_flag") %>%
+    filter(n_flag > 0) %>%
+    mutate(pct_of_car = round(100 * n_flag / sum(n_flag), 2)) %>%
+    arrange(desc(n_flag))
+  cat("\nFlag+ cells by global broad_label:\n"); print(flag_broad)
+  rm(global_md); invisible(gc())
+} else {
+  warning("global MC object not found, broad_label breakdown skipped: ", global_path)
+}
+```
+
+```{r car-apply}
+shared_barcodes <- intersect(rownames(extcalls_meta), colnames(obj))
+cat(sprintf("\nBarcode transfer: %d of %d subset cells matched (%.2f%%)\n",
+            length(shared_barcodes), ncol(obj),
+            100 * length(shared_barcodes) / ncol(obj)))
+
+obj <- AddMetaData(obj, metadata = extcalls_meta[shared_barcodes, , drop = FALSE])
+obj$flag_pos <- as_flag_logical(obj$flag_pos)
+stopifnot(is.logical(obj$flag_pos), !anyNA(obj$flag_pos))
+
+n_flag_sub <- sum(obj$flag_pos)
+cat(sprintf("\nFlag+ landing in subset:        %d (%.2f%% of all Flag+, %.2f%% of T cells)\n",
+            n_flag_sub, 100 * n_flag_sub / n_flag_ext, 100 * n_flag_sub / ncol(obj)))
+cat(sprintf("Flag+ lost outside subset:      %d\n", n_flag_ext - n_flag_sub))
+
+flag_by_label <- obj@meta.data %>%
+  group_by(cell_label) %>%
+  summarise(n_cells = n(), n_flag = sum(flag_pos),
+            pct_flag_of_label = round(100 * mean(flag_pos), 2), .groups = "drop") %>%
+  mutate(pct_of_flag_in_T = round(100 * n_flag / sum(n_flag), 2)) %>%
+  arrange(desc(n_flag))
+cat("\nFlag+ cells by cluster_label:\n"); print(as.data.frame(flag_by_label))
+
+# A NEW column. cluster_label, cell_label and mc_state are left untouched.
+# "pos"/"neg" rather than +/- because a "+" in a factor level breaks formula
+# parsing, file names and several ggplot label paths.
+obj$cluster_label_flag <- paste0(obj$cell_label,
+                                ifelse(obj$flag_pos, "_flagpos", "_flagneg"))
+cat("\ncluster_label_flag levels:", length(unique(obj$cluster_label_flag)), "\n")
+
+n_flag_dropped <- sum(flag_by_label$n_flag[flag_by_label$cell_label %in% drop_labels])
+cat(sprintf("\nFlag+ in dropped labels (%s): %d (%.2f%% of Flag+ in subset)\n",
+            paste(drop_labels, collapse = "/"), n_flag_dropped,
+            100 * n_flag_dropped / max(n_flag_sub, 1)))
+cat(sprintf("Flag+ retained for plotting:      %d\n", n_flag_sub - n_flag_dropped))
+```
+
+```{r save-rds}
+# written to its own file, not back over the 05 output: 11 reads this one and
+# the annotated object stays reproducible from 05 alone
+saveRDS(obj, file.path(DIR_RDS, SUBSET_SLUG, "metacell",
+                       paste0(FILE_PREFIX, "_MC_TCR.RDS")))
+```
+
+```{r analysis-frames, results = FALSE}
+# drop_labels is applied to every figure. Without it Outlier appears with
+# ~10,000 cells in clonalOccupy.
+#
+# subset(), not obj[, cells]. The bracket form drops the reductions in Seurat v5,
+# which is what silently disabled clonalNetwork in the previous run.
+# Intersected with the cells that actually carry embeddings: DimPlot cbinds the
+# embedding matrix onto the metadata and fails with "arguments imply differing
+# number of rows" if the two disagree.
+keep_cells <- colnames(obj)[!obj$cell_label %in% drop_labels]
+keep_cells <- intersect(keep_cells, rownames(Embeddings(obj, "umap")))
+obj_plot   <- subset(obj, cells = keep_cells)
+Idents(obj_plot) <- factor(obj_plot$cell_label)
+stopifnot(nrow(Embeddings(obj_plot, "umap")) == ncol(obj_plot))
+
+md_v <- obj@meta.data %>% filter(has_vdj, !cell_label %in% drop_labels)
+md_v$cell_label <- factor(md_v$cell_label, levels = sort(unique(md_v$cell_label)))
+
+PAL_STATE <- cat_pal(md_v$cell_label)
+
+# scRepertoire orders cloneSize largest-first (Hyperexpanded ... Rare), while
+# count_bin and occ_bin are cut() output and run smallest-first. Without this the
+# two scales point opposite ways and Rare comes out red.
+cs_levels     <- levels(droplevels(md_v$cloneSize))
+PAL_CLONESIZE <- seq_pal(md_v$cloneSize, rev = grepl("^Hyperexpanded", cs_levels[1]))
+PAL_COUNTBIN  <- seq_pal(md_v$count_bin)
+cat("cloneSize levels as ordered:", paste(cs_levels, collapse = " | "), "\n")
+
+# patients get their own palette, distinct from the cell-state one: greens for
+# CTRL, purples for CASE, so the annotation track cannot be confused with a state.
+ctrl_cats <- grep("^CTRL", CAT_LEVELS, value = TRUE)
+ec_cats   <- grep("^CASE",   CAT_LEVELS, value = TRUE)
+PAL_PATIENT <- setNames(
+  c(grDevices::colorRampPalette(c("#00441B", "#A1D99B"))(length(ctrl_cats)),
+    grDevices::colorRampPalette(c("#3F007D", "#BCBDDC"))(length(ec_cats))),
+  c(ctrl_cats, ec_cats))
+```
+
+<!--
+Figure choices below follow published repertoire panels: the occurrence-break
+stacked bar and clone-size ramp from Cell Rep Methods 2024 Fig 1C, per-clone
+phenotype composition bars with a patient annotation track, clone-size
+ridgelines per patient, and the patient x state x visit sharing dot plot.
+
+Expanded vs unique (>= 2 cells) is the headline expansion statement because it
+rests on no chosen cutoff. Both binned scales are kept anyway, since the
+per-state composition view needs them, and the rank-abundance and ridgeline
+panels are shown alongside as the binning-free versions.
+
+Clones are never pooled across patients. With a handful of patients and uneven
+visit counts, pooling lets the deepest patient set the answer. See
+docs/12_clonal.md.
+-->
+
+# Expanded versus unique
+
+The one expansion statement that rests on no chosen cutoff. Both Nature Medicine
+papers open with it before any binning.
+
+```{r fig-expanded-unique, fig.width = 12, fig.height = 5}
+clonal_state <- md_v %>%
+  dplyr::count(condition, cell_label, clonal_status, name = "n_cells") %>%
+  group_by(condition, cell_label) %>%
+  mutate(pct = 100 * n_cells / sum(n_cells), n_tot = sum(n_cells)) %>%
+  ungroup() %>% filter(n_tot >= 20)
+
+n_lab <- md_v %>% distinct(condition, patient_id) %>% dplyr::count(condition) %>%
+  mutate(lab = sprintf("%s (n = %d patients)", condition, n))
+clonal_state <- clonal_state %>%
+  left_join(n_lab %>% dplyr::select(condition, lab), by = "condition")
+
+p_expunique <- ggplot(clonal_state, aes(cell_label, pct, fill = clonal_status)) +
+  geom_col(width = 0.85) +
+  facet_grid(~ lab) +
+    geom_text(data = clonal_state %>% distinct(lab, cell_label, n_tot),
+        aes(x = cell_label, y = 103, label = n_tot),
+        inherit.aes = FALSE, size = 2.2, colour = "grey30") +
+  coord_cartesian(ylim = c(0, 108), clip = "off") +
+  scale_fill_manual(values = PAL_CLONAL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "% of TCR+ cells", fill = "Clonality",
+       title = paste0(SUBSET_TITLE, ": clonal expansion landscape"),
+       subtitle = "Expanded = clone of 2 or more cells. States with <20 TCR+ cells are dropped.") +
+  theme_tcr()
+p_expunique
+```
+
+# Occurrence spectrum
+
+Cell Rep Methods Fig 1C. Each clonotype is binned by the percentage of its own
+sample's repertoire that it occupies, and the bars show what fraction of the
+repertoire sits in each occurrence band. Because the bin is a share rather than
+a cell count, samples of very different depth sit on the same scale, which is
+the objection to the count bins and the reason this panel is worth having.
+
+```{r fig-occurrence, fig.width = 12, fig.height = 5.5}
+occ_tbl <- md_v %>%
+  filter(!is.na(occ_bin)) %>%
+  dplyr::count(category_plot, condition, timepoint, occ_bin, name = "n_cells") %>%
+   group_by(category_plot) %>%
+  mutate(pct = 100 * n_cells / sum(n_cells), n_tot = sum(n_cells)) %>% ungroup()
+
+p_occ_spec <- ggplot(occ_tbl, aes(category_plot, pct, fill = occ_bin)) +
+  geom_col(width = 0.85) +
+  facet_cond(~ condition) +
+  geom_text(data = occ_tbl %>% distinct(category_plot, condition, n_tot),
+      aes(x = category_plot, y = 103, label = n_tot),
+      inherit.aes = FALSE, size = 2.2, colour = "grey30") +
+  coord_cartesian(ylim = c(0, 108), clip = "off") +
+  scale_fill_manual(values = PAL_OCC, drop = FALSE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "Cumulative frequency (% of TCR+ cells)",
+       fill = "Occurrence (%)",
+       title = paste0(SUBSET_TITLE, ": clonotype occurrence spectrum"),
+       subtitle = "Each clone binned by its share of its own sample. Depth-independent.") +
+  theme_tcr()
+p_occ_spec
+```
+
+# Per-clone phenotype composition
+
+Nat Med 2023 ED Fig 3A, which is the panel worth stealing outright. One bar per
+clone, stacked by the states its cells occupy, clones sorted along a composition
+gradient inside each arm. The sorting is what makes it legible: it turns a wall
+of bars into a wave, and a difference between arms shows up as a different
+dominant colour rather than as a number.
+
+The strip above the bars is one tile per clone coloured by patient, so a pattern
+driven by a single patient is visible immediately rather than being buried.
+
+Only expanded clones are drawn: a singlet clone is one cell and its "composition"
+is a single state by construction, which would flatten the gradient.
+
+```{r fig-clone-composition, fig.width = 13, fig.height = 7}
+MIN_CLONE_CELLS <- 3   # a 2-cell clone can only ever be 100/0 or 50/50
+
+clone_state <- md_v %>%
+  filter(clonalFrequency >= MIN_CLONE_CELLS) %>%
+  group_by(condition, patient_id, category, CTstrict) %>%
+  mutate(clone_n = n()) %>%
+  dplyr::count(condition, patient_id, category, CTstrict, clone_n, cell_label,
+               name = "n_cells") %>%
+  group_by(condition, patient_id, CTstrict) %>%
+  mutate(frac = n_cells / sum(n_cells)) %>% ungroup() %>%
+  mutate(clone_key = paste(patient_id, CTstrict, sep = "|"))
+
+# order clones by their dominant state, then by how dominant it is. This is the
+# gradient; the alternative (ordering by one chosen state) presupposes an answer.
+state_order <- levels(md_v$cell_label)
+clone_order <- clone_state %>%
+  group_by(condition, clone_key) %>%
+  slice_max(frac, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(dom = factor(cell_label, levels = state_order)) %>%
+  arrange(condition, dom, desc(frac)) %>%
+  mutate(ord = row_number()) %>%
+  dplyr::select(clone_key, ord, dom)
+
+clone_state <- clone_state %>% left_join(clone_order, by = "clone_key")
+
+cat(sprintf("Clones drawn (>= %d cells): %d CTRL, %d CASE\n", MIN_CLONE_CELLS,
+            n_distinct(clone_state$clone_key[clone_state$condition == "CTRL"]),
+            n_distinct(clone_state$clone_key[clone_state$condition == "CASE"])))
+
+p_comp_main <- ggplot(clone_state,
+                      aes(reorder(clone_key, ord), 100 * frac, fill = cell_label)) +
+  geom_col(width = 1) +
+  facet_cond(~ condition) +
+  scale_fill_manual(values = PAL_STATE) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = "Individual clones", y = "% of clone's cells", fill = "Cell state",
+       subtitle = paste("bar = one clone (>=3 cells);",
+                        "striped bar = lineage spanning across different states;",
+                        "Clones are sorted by dominant state, so each colour's",
+                        "run width = clonal space that state dominates")) +
+  theme_tcr() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+p_comp_track <- ggplot(clone_state %>% distinct(condition, clone_key, ord, category),
+                       aes(reorder(clone_key, ord), 1, fill = category)) +
+  geom_tile() +
+  facet_cond(~ condition) +
+  # PAL_PATIENT, not the cell-state palette: the track and the bars sit on the
+  # same x axis, so sharing colours between them makes the figure unreadable.
+  scale_fill_manual(values = PAL_PATIENT) +
+  scale_y_continuous(expand = c(0, 0)) +
+  guides(fill = guide_legend(nrow = 1, title = "Patient")) +
+  labs(x = NULL, y = NULL,
+       title = paste0(SUBSET_TITLE, ": phenotype composition of individual clones")) +
+  theme_void() +
+  theme(strip.text = element_blank(),
+        legend.position = "top",
+        legend.key.size = unit(0.35, "cm"),
+        plot.title = element_text(face = "bold", size = rel(1.0)),
+        plot.margin = margin(2, 2, 0, 2))
+
+p_clone_comp <- p_comp_track / p_comp_main + plot_layout(heights = c(0.06, 1))
+p_clone_comp
+```
+
+# Clone size distribution per patient
+
+Nat Med 2023 Fig 1h. Density of clone sizes on a log axis, one row per patient,
+with a tick for every individual clone so the tail is honest rather than
+smoothed away. Patients are blocked by arm.
+
+```{r fig-ridgeline, fig.width = 9, fig.height = 7, eval = have_ridges}
+clone_sizes <- md_v %>%
+  distinct(condition, category, patient_id, CTstrict, patient_clone_n) %>%
+  filter(!is.na(patient_clone_n)) %>%
+  mutate(category = factor(category, levels = rev(CAT_LEVELS)))
+
+p_ridge <- ggplot(clone_sizes, aes(patient_clone_n, category, fill = condition)) +
+  ggridges::geom_density_ridges(
+    jittered_points = TRUE, position = ggridges::position_points_jitter(height = 0),
+    point_shape = "|", point_size = 1.6, point_alpha = 0.5,
+    alpha = 0.75, scale = 1.6, linewidth = 0.3) +
+  scale_x_log10() +
+  scale_fill_manual(values = PAL_COND) +
+  labs(x = "Clone size (cells per clone, per patient)", y = NULL, fill = NULL,
+       title = paste0(SUBSET_TITLE, ": clone size distribution per patient"),
+       subtitle = "Ticks are individual clones.") +
+  theme_tcr() + theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+p_ridge
+```
+
+# Where the big clones sit
+
+Nat Med 2025 Fig 2i and ED2j. Patient on y, cell state on x, one facet per
+visit, point size the clone's cell count and point colour the arm. Four
+variables in one grid, no wasted space, and it keeps patient identity visible
+instead of averaging it away.
+
+```{r fig-sharing-dots, fig.width = 13, fig.height = 6}
+TOP_N_CLONES <- 5   # per patient per state per visit
+
+top_clone_dots <- md_v %>%
+  dplyr::count(condition, category, patient_id, timepoint, cell_label, CTstrict,
+               name = "n_cells") %>%
+  group_by(category, timepoint, cell_label) %>%
+  slice_max(n_cells, n = TOP_N_CLONES, with_ties = FALSE) %>%
+  ungroup() %>%
+  filter(n_cells >= 2) %>%
+  mutate(category = factor(category, levels = rev(CAT_LEVELS)))
+
+p_dots <- ggplot(top_clone_dots,
+                 aes(cell_label, category, size = n_cells, colour = condition)) +
+  geom_point(alpha = 0.75) +
+  facet_grid(~ timepoint) +
+  scale_colour_manual(values = PAL_COND) +
+  scale_size_continuous(range = c(1, 7)) +
+  labs(x = NULL, y = NULL, size = "Clone size", colour = NULL,
+       title = paste0(SUBSET_TITLE, ": largest clones by patient, state and visit"),
+       subtitle = sprintf("Top %d expanded clones per patient x state x visit.", TOP_N_CLONES)) +
+  theme_tcr()
+p_dots
+```
+
+# UMAP by clone size
+
+```{r dimplot, fig.width = 15, fig.height = 6}
+p_umap_clone <- DimPlot(obj_plot, group.by = "cloneSize", order = TRUE) +
+  scale_colour_manual(values = PAL_CLONESIZE, na.value = "grey88") +
+  labs(title = "Clone size (proportion scale)") + theme_tcr() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+p_umap_state <- DimPlot(obj_plot, group.by = "cluster_label", label = TRUE,
+                        label.size = 3, repel = TRUE) +
+  scale_colour_manual(values = PAL_STATE) +
+  labs(title = "Cell state") + theme_tcr() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 0, hjust = 0.5))
+p_umap_clone + p_umap_state
+```
+
+```{r dimplot-2, fig.width = 15, fig.height = 6}
+p_umap_count <- DimPlot(obj_plot, group.by = "count_bin", order = TRUE) +
+  scale_colour_manual(values = PAL_COUNTBIN, na.value = "grey88") +
+  labs(title = "Clone size (cell count)") + theme_tcr() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+p_umap_car <- DimPlot(obj_plot, group.by = "flag_pos", order = TRUE) +
+  scale_colour_manual(values = PAL_FLAG) +
+  labs(title = "flag by expression") + theme_tcr() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+p_umap_count + p_umap_car
+```
+
+```{r dimplot-pdf, results = FALSE}
+pdf(file.path(fig_dir, paste0(FILE_PREFIX, "_clonal_umap.pdf")), width = 15, height = 6)
+print(p_umap_clone + p_umap_state)
+print(p_umap_count + p_umap_car)
+print(DimPlot(obj_plot, group.by = "cloneSize", split.by = "condition", order = TRUE) +
+        scale_colour_manual(values = PAL_CLONESIZE, na.value = "grey88") +
+        labs(title = "Clone size, CTRL vs CASE") + theme_tcr() +
+        theme(axis.text.x = element_text(angle = 0, hjust = 0.5)))
+invisible(dev.off())
+```
+
+# Clone size distributions
+
+Rebuilt from the scRepertoire export tables so each panel can be facetted by
+condition and drawn on the shared palette. Same numbers, controllable figure.
+
+```{r export-tables, results = FALSE}
+quant_tbl <- add_origin(clonalQuant(combined_lab, cloneCall = CLONE_CALL, chain = "both",
+                                    scale = TRUE, exportTable = TRUE))
+homeo_tbl <- add_origin(clonalHomeostasis(combined_lab, cloneCall = CLONE_CALL,
+                                          exportTable = TRUE))
+prop_tbl  <- add_origin(clonalProportion(combined_lab, cloneCall = CLONE_CALL,
+                                         clonalSplit = c(1, 10, 25, 100, 500, 1000, 1e5),
+                                         exportTable = TRUE))
+
+abund_tbl <- add_origin(clonalAbundance(combined_lab, cloneCall = CLONE_CALL,
+                                        exportTable = TRUE))
+len_tbl   <- add_origin(clonalLength(combined_lab, cloneCall = "aa", chain = "both",
+                                     exportTable = TRUE))
+
+# long form for plotting: one row per sample x bin, with condition attached
+to_long <- function(d, name_to) {
+  num <- names(d)[vapply(d, is.numeric, logical(1))]
+  d %>% dplyr::select(sample_origin, all_of(num)) %>%
+    pivot_longer(all_of(num), names_to = name_to, values_to = "value") %>%
+    mutate(!!name_to := factor(.data[[name_to]], levels = num)) %>%
+    left_join(sample_meta, by = "sample_origin") %>%
+    mutate(category_plot = factor(category_plot, levels = CATPLOT_LEVELS))
+}
+```
+
+```{r fig-homeostasis, fig.width = 11, fig.height = 5}
+homeo_long <- to_long(homeo_tbl, "bin")
+p_homeo <- ggplot(homeo_long, aes(category_plot, 100 * value, fill = bin)) +
+  geom_col(width = 0.8) +
+  facet_cond(~ condition) +
+  scale_fill_manual(values = seq_pal(homeo_long$bin)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "% of repertoire", fill = "clone size",
+       title = paste0(SUBSET_TITLE, ": clonal space homeostasis"),
+       subtitle = "Proportion scale. How much of each repertoire the expanded clones occupy.") +
+  theme_tcr()
+p_homeo
+```
+
+```{r fig-proportion, fig.width = 11, fig.height = 5}
+prop_long <- to_long(prop_tbl, "rank_band")
+p_prop <- ggplot(prop_long, aes(category_plot, 100 * value, fill = rank_band)) +
+  geom_col(width = 0.8) +
+  facet_cond(~ condition) +
+  scale_fill_manual(values = seq_pal(prop_long$rank_band)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "% of repertoire", fill = "clone rank",
+       title = paste0(SUBSET_TITLE, ": repertoire held by the top N ranked clones")) +
+  theme_tcr()
+p_prop
+```
+
+```{r fig-quant, fig.width = 11, fig.height = 4.5}
+# quant_tbl already carries category_plot from add_origin(). Joining all of
+# sample_meta suffixed it to category_plot.x / .y, so the mutate below could not
+# find it. Only the columns quant_tbl lacks are pulled in.
+quant_plot <- quant_tbl %>%
+  left_join(sample_meta %>% dplyr::select(sample_origin, condition),
+            by = "sample_origin") %>%
+  mutate(category_plot = factor(category_plot, levels = CATPLOT_LEVELS))
+yv <- if ("scaled" %in% names(quant_plot)) "scaled" else "values"
+p_quant <- ggplot(quant_plot, aes(category_plot, .data[[yv]], fill = condition)) +
+  geom_col(width = 0.8) +
+  facet_cond(~ condition) +
+  scale_fill_manual(values = PAL_COND, guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = "unique clones per 100 cells",
+       title = paste0(SUBSET_TITLE, ": unique clones, scaled to cells sequenced")) +
+  theme_tcr()
+p_quant
+```
+
+```{r fig-rank-abundance, fig.width = 10, fig.height = 5}
+# rank-abundance on log-log. A steeper head means a more clonally dominated
+# repertoire, and it does not depend on any binning choice.
+rank_ab <- md_v %>%
+  dplyr::count(category_plot, category, condition, timepoint, CTstrict, name = "n") %>%
+  group_by(category_plot) %>%
+  arrange(desc(n), .by_group = TRUE) %>%
+  mutate(rank = row_number(), prop = n / sum(n)) %>%
+  ungroup()
+# coloured by patient, not condition: with one line per sample the arm is already
+# given by the facet, so the colour is free to say which patient a line belongs to.
+p_rank <- ggplot(rank_ab, aes(rank, 100 * prop, group = category_plot, colour = category)) +
+  geom_line(alpha = 0.85, linewidth = 0.5) +
+  facet_grid(~ condition) +
+  scale_x_log10() + scale_y_log10() +
+  scale_colour_manual(values = PAL_PATIENT) +
+  labs(x = "clone rank", y = "% of TCR+ cells", colour = "Patient",
+       title = paste0(SUBSET_TITLE, ": rank-abundance"),
+       subtitle = "One line per sample, coloured by patient. A heavier head is a more dominated repertoire.") +
+  theme_tcr() + theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+p_rank
+```
+
+```{r fig-occupancy, fig.width = 11, fig.height = 5}
+occ_samp <- md_v %>%
+  dplyr::count(category_plot, condition, cloneSize, name = "n_cells") %>%
+    group_by(category_plot) %>%
+  mutate(pct = 100 * n_cells / sum(n_cells), n_tot = sum(n_cells)) %>% ungroup()
+
+
+p_occ_samp <- ggplot(occ_samp, aes(category_plot, pct, fill = cloneSize)) +
+  geom_col(width = 0.8) +
+  facet_cond(~ condition) +
+  geom_text(data = occ_samp %>% distinct(category_plot, condition, n_tot),
+      aes(x = category_plot, y = 103, label = n_tot),
+      inherit.aes = FALSE, size = 2.2, colour = "grey30") +
+  coord_cartesian(ylim = c(0, 108), clip = "off") +
+  scale_fill_manual(values = PAL_CLONESIZE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "% of TCR+ cells", fill = "clone size",
+       title = paste0(SUBSET_TITLE, ": clone size occupancy by sample")) +
+  theme_tcr()
+p_occ_samp
+```
+
+```{r fig-occupancy-state, fig.width = 12, fig.height = 5}
+occ_state <- md_v %>%
+  dplyr::count(condition, cell_label, cloneSize, name = "n_cells") %>%
+   group_by(condition, cell_label) %>%
+  mutate(pct = 100 * n_cells / sum(n_cells), n_tot = sum(n_cells)) %>% ungroup()
+
+
+p_occ_state <- ggplot(occ_state, aes(cell_label, pct, fill = cloneSize)) +
+  geom_col(width = 0.8) +
+  facet_grid(~ condition) +
+  geom_text(data = occ_state %>% distinct(condition, cell_label, n_tot),
+        aes(x = cell_label, y = 103, label = n_tot),
+        inherit.aes = FALSE, size = 2.2, colour = "grey30") +
+  coord_cartesian(ylim = c(0, 108), clip = "off") +
+  scale_fill_manual(values = PAL_CLONESIZE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "% of TCR+ cells", fill = "clone size",
+       title = paste0(SUBSET_TITLE, ": clone size occupancy by state")) +
+  theme_tcr()
+p_occ_state
+```
+
+# Expansion stratified by state and visit
+
+The panel this is modelled on stratifies expansion by cell state and by group,
+so a reader sees at a glance which states carry the expanded clones in which
+arm. Two versions, because the aggregation question is real:
+
+  - **per sample**, one point per sample, timepoints kept separate. This is the
+    honest version: pooling T0 with T4 inside a patient averages over the
+    biology being asked about.
+  - **composition over time**, clone size stacked within each state at each
+    visit. Denser, and shows the direction of travel rather than a snapshot.
+
+Nothing here is aggregated to the patient. Patient-level aggregation happens
+once, in the stats notebook, where it is the unit of the test and is flagged.
+
+```{r fig-expansion-by-state, fig.width = 12, fig.height = 5.5}
+exp_by_state_sample <- md_v %>%
+  group_by(category_plot, category, condition, timepoint, cell_label) %>%
+  summarise(n_cells = n(), pct_expanded = 100 * mean(clonalFrequency > 1),
+            .groups = "drop") %>%
+  filter(n_cells >= 20)   # a state with a handful of cells gives a meaningless percentage
+
+p_exp_state <- ggplot(exp_by_state_sample,
+                      aes(cell_label, pct_expanded, colour = condition)) +
+  geom_boxplot(aes(fill = condition), alpha = 0.15, outlier.shape = NA,
+               linewidth = 0.4, show.legend = FALSE) +
+  geom_point(position = position_jitter(width = 0.15, height = 0), size = 1.6, alpha = 0.85) +
+  facet_grid(~ condition) +
+  scale_colour_manual(values = PAL_COND, guide = "none") +
+  scale_fill_manual(values = PAL_COND, guide = "none") +
+  labs(x = NULL, y = "% of TCR+ cells in expanded clones",
+       title = paste0(SUBSET_TITLE, ": clonal expansion by cell state"),
+       subtitle = "One point per sample. States with <20 TCR+ cells in a sample are dropped.") +
+  theme_tcr()
+p_exp_state
+```
+
+```{r fig-composition-time, fig.width = 12, fig.height = 8}
+bin_by_state <- md_v %>%
+  dplyr::count(condition, timepoint, cell_label, cloneSize, name = "n_cells") %>%
+  group_by(condition, timepoint, cell_label) %>%
+  mutate(pct = 100 * n_cells / sum(n_cells), n_tot = sum(n_cells)) %>%
+  ungroup() %>%
+  filter(n_tot >= 20)
+
+p_comp_time <- ggplot(bin_by_state, aes(timepoint, pct, fill = cloneSize)) +
+  geom_col(width = 0.85) +
+  facet_grid(cell_label ~ condition, switch = "y") +
+  geom_text(data = bin_by_state %>% distinct(condition, timepoint, cell_label, n_tot),
+      aes(x = timepoint, y = 106, label = n_tot),
+      inherit.aes = FALSE, size = 1.8, colour = "grey30") +
+  coord_cartesian(ylim = c(0, 115), clip = "off") +
+  scale_fill_manual(values = PAL_CLONESIZE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "% of TCR+ cells", fill = "clone size",
+       title = paste0(SUBSET_TITLE, ": clone size composition over time, by state"),
+       subtitle = "Timepoints kept separate. Cells of a state x visit with <20 TCR+ cells are dropped.") +
+  theme_tcr() +
+  theme(strip.text.y.left = element_text(angle = 0, hjust = 1, size = rel(0.75)),
+        strip.placement = "outside",
+        axis.text.x = element_text(angle = 0, hjust = 0.5, size = rel(0.8)))
+p_comp_time
+```
+
+```{r fig-expansion-time, fig.width = 11, fig.height = 5}
+exp_traj <- md_v %>%
+  group_by(category, patient_id, condition, timepoint) %>%
+  summarise(pct_expanded = 100 * mean(clonalFrequency > 1), n_cells = n(), .groups = "drop")
+
+p_exp_traj <- ggplot(exp_traj, aes(timepoint, pct_expanded,
+                                   group = category, colour = category)) +
+  geom_line(alpha = 0.85, linewidth = 0.6) + geom_point(size = 2) +
+  facet_grid(~ condition) +
+  coord_cartesian(ylim = c(0, 108), clip = "off") +
+  scale_colour_manual(values = PAL_PATIENT) +
+  labs(x = NULL, y = "% of TCR+ cells in expanded clones", colour = "Patient",
+       title = paste0(SUBSET_TITLE, ": expansion over time")) +
+  theme_tcr() + theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+p_exp_traj
+```
+
+```{r bins-tables}
+count_bins_by_state <- md_v %>%
+  dplyr::count(condition, timepoint, cell_label, count_bin, name = "n_cells") %>%
+  group_by(condition, timepoint, cell_label) %>%
+  mutate(pct = round(100 * n_cells / sum(n_cells), 2)) %>% ungroup()
+
+state_expansion <- md_v %>%
+  group_by(condition, cell_label) %>%
+  summarise(n_cells = n(), n_clones = n_distinct(CTstrict),
+            pct_expanded = round(100 * mean(clonalFrequency > 1), 2),
+            median_clone_size = median(clonalFrequency), .groups = "drop")
+print(as.data.frame(state_expansion))
+```
+
+# Gene usage and clone export
+
+```{r gene-usage}
+gene_usage <- bind_rows(lapply(c("TRBV", "TRBJ", "TRAV", "TRAJ"), function(g)
+  cbind(gene_class = g,
+        add_origin(vizGenes(combined_lab, x.axis = g, plot = "heatmap",
+                            exportTable = TRUE)))))
+
+exported_clones <- add_origin(exportClones(combined_lab, write.file = FALSE))
+```
+
+# Flag+ clones
+
+```{r car-clones, fig.width = 11, fig.height = 5}
+car_clones <- md_v %>%
+  group_by(category, patient_id, condition, CTstrict) %>%
+  summarise(n_cells = n(), n_flag = sum(flag_pos),
+            pct_flag = round(100 * mean(flag_pos), 2),
+            visits = paste(sort(unique(as.character(timepoint))), collapse = ","),
+            states = paste(sort(unique(cell_label)), collapse = ","),
+            .groups = "drop") %>%
+  filter(n_flag > 0) %>% arrange(desc(n_flag))
+
+car_expansion <- md_v %>%
+  group_by(condition, timepoint, flag_pos) %>%
+  summarise(n_cells = n(), n_clones = n_distinct(CTstrict),
+            pct_expanded = round(100 * mean(clonalFrequency > 1), 2), .groups = "drop")
+print(as.data.frame(car_expansion))
+
+# clone size composition of Flag+ against Flag- cells
+car_comp <- md_v %>%
+  filter(!(timepoint == "T0" & flag_pos)) %>%   # no flag pre-infusion; these are detector background
+  dplyr::count(condition, timepoint, flag_pos, cloneSize, name = "n_cells") %>%
+  group_by(condition, timepoint, flag_pos) %>%
+  mutate(pct = 100 * n_cells / sum(n_cells), n_tot = sum(n_cells)) %>%
+  ungroup() %>% filter(n_tot >= 20) %>%
+  mutate(flag = factor(ifelse(flag_pos, "Flag+", "Flag-"), levels = c("Flag-", "Flag+")))
+
+
+p_car_comp <- ggplot(car_comp, aes(flag, pct, fill = cloneSize)) +
+  geom_col(width = 0.8) +
+  facet_grid(condition ~ timepoint) +
+  geom_text(data = car_comp %>% distinct(condition, timepoint, flag, n_tot),
+        aes(x = flag, y = 103, label = n_tot),
+        inherit.aes = FALSE, size = 2.4, colour = "grey30") +
+  coord_cartesian(ylim = c(0, 108), clip = "off") +
+  scale_fill_manual(values = PAL_CLONESIZE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "% of TCR+ cells", fill = "clone size",
+       title = paste0(SUBSET_TITLE, ": clone size composition, Flag+ vs Flag-"),
+       subtitle = "Cells of a flag x visit group with <20 TCR+ cells are dropped.") +
+  theme_tcr() + theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+p_car_comp
+```
+
+## Clone size by state and flag status, over time
+
+`p_comp_time` with flag positivity added. `cluster_label_flag` (state + `_flagpos` /
+`_flagneg`) is on the object for any other use; the figure splits it back into a
+state row and a flag column rather than putting 2 x n_states labels down one axis,
+because that is the same information and stays readable.
+
+Flag- is the internal control for Flag+ within the same state and visit, which is
+the comparison the fragmented label is for.
+
+```{r fig-composition-car-state, fig.width = 13, fig.height = 9}
+bin_state_car <- md_v %>%
+  filter(!(timepoint == "T0" & flag_pos)) %>%
+  mutate(flag = factor(ifelse(flag_pos, "flagpos", "flagneg"),
+                      levels = c("flagneg", "flagpos"))) %>%
+  dplyr::count(condition, flag, timepoint, cell_label, cloneSize, name = "n_cells") %>%
+  group_by(condition, flag, timepoint, cell_label) %>%
+  mutate(pct = 100 * n_cells / sum(n_cells), n_tot = sum(n_cells)) %>%
+  ungroup() %>%
+  filter(n_tot >= 20)
+
+p_comp_car_state <- ggplot(bin_state_car, aes(timepoint, pct, fill = cloneSize)) +
+  geom_col(width = 0.85) +
+  facet_grid(cell_label ~ condition + flag, switch = "y") +
+    geom_text(data = bin_state_car %>% distinct(condition, flag, timepoint, cell_label, n_tot),
+      aes(x = timepoint, y = 106, label = n_tot),
+      inherit.aes = FALSE, size = 1.7, colour = "grey30") +
+  coord_cartesian(ylim = c(0, 115), clip = "off") +
+  scale_fill_manual(values = PAL_CLONESIZE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "% of TCR+ cells", fill = "clone size",
+       title = paste0(SUBSET_TITLE, ": clone size by state and flag status, over time"))+#,
+       # subtitle = "Timepoints kept separate. A state x visit x flag group with <20 TCR+ cells is dropped, so gaps are absent data, not zero expansion.") +
+  theme_tcr() +
+  theme(strip.text.y.left = element_text(angle = 0, hjust = 1, size = rel(0.7)),
+        strip.placement = "outside",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = rel(0.7)))
+p_comp_car_state
+```
+
+```{r clonal-network, fig.width = 10, fig.height = 7}
+net_tbl <- clonalNetwork(obj_plot, reduction = "umap", group.by = "cell_label",
+                         filter.clones = NULL, filter.identity = NULL,
+                         cloneCall = CLONE_CALL, exportTable = TRUE)
+net_tbl <- as.data.frame(net_tbl)
+cat("clonalNetwork exportTable columns:", paste(names(net_tbl), collapse = ", "), "\n")
+
+wt <- intersect(c("weight", "value", "prop"), names(net_tbl))[1]
+p_net <- ggplot(net_tbl, aes(to, from, fill = .data[[wt]])) +
+  geom_tile(colour = "grey90", linewidth = 0.2) +
+  scale_fill_gradientn(colours = PAL_SEQ) +
+  coord_equal() +
+  labs(x = "also found in", y = "clones from", fill = wt,
+       title = paste0(SUBSET_TITLE, ": clonal sharing between states"),
+       subtitle = "clonalNetwork numbers drawn as a matrix") +
+  theme_tcr() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = rel(0.75)),
+        axis.text.y = element_text(size = rel(0.75)),
+        panel.grid = element_blank())
+p_net
+```
+
+# Write the figures
+
+```{r figures-pdf, results = FALSE}
+to_pdf <- function(file, width, height, exprs) {
+  pdf(file.path(fig_dir, file), width = width, height = height)
+  on.exit(invisible(dev.off()), add = TRUE)
+  for (nm in names(exprs)) {
+    tryCatch(print(exprs[[nm]]),
+             error = function(e) message("figure skipped: ", nm, " -- ",
+                                         conditionMessage(e)))
+  }
+}
+
+to_pdf(paste0(FILE_PREFIX, "_clonal_distributions.pdf"), 12, 6, list(
+  quant = p_quant, homeostasis = p_homeo, proportion = p_prop,
+  rank_abundance = p_rank, occupancy_sample = p_occ_samp,
+  occupancy_state = p_occ_state, occurrence = p_occ_spec,
+  expanded_unique = p_expunique, expansion_state = p_exp_state,
+  expansion_time = p_exp_traj, car_composition = p_car_comp))
+
+to_pdf(paste0(FILE_PREFIX, "_clone_size_composition.pdf"), 13, 9, list(
+  composition_time = p_comp_time, composition_car_state = p_comp_car_state,
+  clone_composition = p_clone_comp))
+
+to_pdf(paste0(FILE_PREFIX, "_clone_landscape.pdf"), 13, 7, c(
+  list(clone_dots = p_dots),
+  list(ridgeline = p_ridge)))
+
+to_pdf(paste0(FILE_PREFIX, "_clonal_network.pdf"), 10, 7, list(network_matrix = p_net))
+```
+
+# Write the workbook
+
+Every table is listed once, here, after all of it has been computed. Nothing
+accumulates in a global as the notebook runs, so re-running a chunk cannot
+corrupt the workbook and the sheet list is readable in one screen.
+
+```{r write}
+sheet <- function(d, desc) {
+  if (is.null(d)) return(NULL)
+  d <- as.data.frame(d)
+  if (!nrow(d)) return(NULL)
+  list(d = d, desc = desc)
+}
+
+BOOK <- list(
+  contig_file_map = sheet(path_map,
+    "Which contig file was used for each sample, and its sequencing batch. Verify by eye once."),
+  vdj_recovery = sheet(vdj_qc,
+    "Cells recovered with a TCR per sample, after filtering contigs to object barcodes."),
+  chain_dropout = sheet(dropout_qc,
+    "Alpha-chain dropout per sample. High pct_beta_only inflates n_clones and deflates clonality."),
+  car_by_broad_label = sheet(if (exists("flag_broad")) flag_broad else NULL,
+    "Where Flag+ cells land across the whole dataset, before subsetting to T cells."),
+  car_by_cluster_label = sheet(flag_by_label,
+    "Flag+ cells per annotated T cell state."),
+  expanded_vs_unique = sheet(clonal_state %>% mutate(pct = round(pct, 2)),
+    "Percent of TCR+ cells in expanded (>=2 cell) versus unique clones, per state per condition."),
+  occurrence_spectrum = sheet(occ_tbl %>% mutate(pct = round(pct, 3)),
+    "Cumulative frequency of clonotypes per occurrence band per sample. Cell Rep Methods Fig 1C."),
+  clone_phenotype_composition = sheet(
+    clone_state %>% mutate(frac = round(frac, 4)) %>%
+      dplyr::select(condition, category, patient_id, CTstrict, clone_n,
+                    cell_label, n_cells, frac),
+    "State composition of every clone with >=3 cells. The data behind the per-clone composition bars."),
+  top_clones_by_state_visit = sheet(top_clone_dots,
+    "Largest expanded clones per patient, state and visit. The data behind the sharing dot plot."),
+  unique_clones = sheet(quant_tbl,
+    "Unique clones per sample, scaled by cells sequenced."),
+  homeostasis = sheet(homeo_tbl,
+    "Fraction of repertoire held by rare/small/medium/large/hyperexpanded clones, per sample."),
+  proportion = sheet(prop_tbl,
+    "Fraction of repertoire held by the top N ranked clones, per sample."),
+  abundance = sheet(abund_tbl,
+    "Every clone with its size, per sample."),
+  cdr3_length = sheet(len_tbl,
+    "CDR3 amino-acid length distribution."),
+  rank_abundance = sheet(rank_ab,
+    "Every clone with its within-sample rank and proportion. The data behind the rank-abundance curve."),
+  expansion_by_state_sample = sheet(exp_by_state_sample,
+    "Percent of TCR+ cells in expanded clones, per state per sample. One point per sample in the expansion figure."),
+  count_bins_by_state = sheet(count_bins_by_state,
+    "Cells per clone-size COUNT bin per state. Count scale, not scRepertoire's proportion scale."),
+  prop_bins_by_state = sheet(bin_by_state %>% mutate(pct = round(pct, 2)),
+    "The same table on scRepertoire's PROPORTION scale (cloneSize). Kept separate on purpose."),
+  state_expansion_by_cond = sheet(state_expansion,
+    "Which states carry expanded clones, pooled within a condition. Descriptive, not tested."),
+  gene_usage = sheet(gene_usage,
+    "V and J gene usage per sample. Also corroborates the public-clone batch question."),
+  exported_clones = sheet(exported_clones,
+    "Full scRepertoire clone export, one row per cell."),
+  car_positive_clones = sheet(car_clones,
+    "Clones containing at least one Flag+ cell, with the visits and states they span."),
+  car_expansion = sheet(car_expansion,
+    "Expansion of Flag+ versus Flag- cells at each visit."),
+  car_clone_size_composition = sheet(car_comp %>% mutate(pct = round(pct, 2)),
+    "Clone size composition of Flag+ versus Flag- cells at each visit."),
+  clone_size_state_by_car = sheet(bin_state_car %>% mutate(pct = round(pct, 2)),
+    "Clone size composition per state per visit, split by flag status. Gaps are groups with <20 TCR+ cells.")
+)
+
+wb <- createWorkbook()
+for (nm in names(BOOK)) {
+  s <- BOOK[[nm]]
+  if (is.null(s)) { cat("empty, not written:", nm, "\n"); next }
+  stopifnot(nchar(nm) <= 31)
+  addWorksheet(wb, nm)
+  writeData(wb, nm, s$desc, startRow = 1, startCol = 1, colNames = FALSE)
+  writeData(wb, nm, s$d,    startRow = 3, rowNames = FALSE)
+  freezePane(wb, nm, firstActiveRow = 4)
+}
+f <- file.path(clone_root, "subset_data_clonal_TCR.xlsx")
+saveWorkbook(wb, f, overwrite = TRUE)
+cat("wrote", basename(f), "-", sum(!vapply(BOOK, is.null, logical(1))), "sheets\n")
+```
+
+<!--
+NOTE ON cloneSize CUTOFFS
+
+Neither set of cutoffs is derived from anything; they are display conventions
+and the two scales are not comparable.
+
+  rnabio, count scale (proportion = FALSE)
+    Single 1, Small <=5, Medium <=20, Large <=100, Hyperexpanded <=500
+  here / scRepertoire default, proportion scale (proportion = TRUE)
+    Rare <=1e-4, Small <=1e-3, Medium <=1e-2, Large <=0.1, Hyperexpanded <=1
+
+Count bins are confounded by depth: a 30-cell clone is 3% of a 1,000-cell
+sample and 0.3% of a 10,000-cell sample, and lands in the same bin. Samples
+here differ several-fold in TCR+ cell number, so the proportion scale is kept.
+The rank-abundance figure is the same information with no binning at all.
+
+Other rnabio defaults not used:
+  cloneCall = "aa"    aa merges distinct rearrangements that share a CDR3aa.
+                      "strict" (V/J + nt CDR3) is the conservative call within
+                      a patient. aa is used only for public clones, in 11.
+  group.by = "sample" equivalent to "none" given one list element per sample.
+  column renaming     only needed when TCR and BCR are attached to one object.
+
+Full reasoning: docs/12_clonal.md.
+-->

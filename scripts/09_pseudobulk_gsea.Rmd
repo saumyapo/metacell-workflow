@@ -1,0 +1,439 @@
+---
+title: "09 Pseudobulk GSEA"
+author: "Saumya Pothukuchi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: cosmo
+    code_folding: hide
+---
+
+```{r, include=FALSE}
+options(width = 60)
+local({
+  hook_output <- knitr::knit_hooks$get('output')
+  knitr::knit_hooks$set(output = function(x, options) {
+    if (!is.null(options$max.height)) options$attr.output <- c(
+      options$attr.output, sprintf('style="max-height: %s;"', options$max.height))
+    hook_output(x, options)
+  })
+})
+```
+
+```{r, results = FALSE, message = FALSE, warning=FALSE}
+library(openxlsx)
+library(clusterProfiler)
+library(msigdbr)
+library(org.Hs.eg.db)
+library(tidyverse)
+library(fgsea)
+library(msigdbdf)
+```
+
+### Information of Used R Libraries
+
+R: `r R.Version()$version.string`,
+clusterProfiler: `r packageVersion('clusterProfiler')`,
+msigdbr: `r packageVersion('msigdbr')`,
+fgsea: `r packageVersion('fgsea')`
+
+# Method
+
+Genes are ranked by the DESeq2 Wald statistic (`stat`), or by the dream moderated t for the
+interaction family, rather than by fold change. The statistic is the effect divided by its
+standard error, so a large but noisy fold change in a low-count gene does not outrank a
+moderate, well-estimated one. The shrunken `avg_log2FC` in the same tables is for the
+volcano plots, where the question is effect size, not evidence. Ranking a pseudobulk
+contrast by log2FC alone puts low-expression genes at both ends of the list and the
+enrichment follows them there.
+
+The omnibus interaction tables carry `F_stat` and no signed statistic, so they cannot be
+ranked. They are scanned anyway and logged as `not rankable` so that every DEG csv is
+accounted for in the manifest rather than silently absent.
+
+# Configuration
+
+Mirrors the DEG configuration exactly: same family names, same directory layout, same
+`FILE_PREFIX__unit__contrast` filename grammar. One input csv gives one output xlsx with
+the same stem plus `__GSEA`, in the matching family folder.
+
+```{r, results = FALSE, message=FALSE, warning=FALSE}
+# LEVEL selects which annotated object this notebook runs on. Nothing else in
+# the file is level-specific, so a subset run is a one-word edit here.
+#   "global"  the whole dataset, annotated by broad lineage in 03
+#   "subset"  one lineage, annotated by state in 05
+LEVEL <- "subset"
+
+source(file.path("..", "config", "config.R"))
+
+CFG <- switch(LEVEL,
+  global = list(slug = "global", prefix = "global",      label = "broad_label",
+                title = "All cell types"),
+  subset = list(slug = "subset", prefix = "subset_data", label = "cluster_label",
+                title = "Subset"),
+  stop("LEVEL must be 'global' or 'subset'"))
+
+SUBSET_SLUG  <- CFG$slug
+FILE_PREFIX  <- CFG$prefix
+LABEL_COL    <- CFG$label     # per-cell annotation column written by 03 or 05
+SUBSET_TITLE <- CFG$title     # appears in every figure title
+
+# the annotated Seurat object written at the end of 03 (global) or 05 (subset)
+rds_path <- file.path(DIR_RDS, SUBSET_SLUG, "metacell",
+                      paste0(FILE_PREFIX, "_MC_annotated.RDS"))
+
+# mirrors the 08 layout exactly, so one DEG csv maps to one GSEA xlsx
+deg_root  <- file.path(out_dirs(SUBSET_SLUG, "csv"), "DEGs")
+gsea_root <- file.path(out_dirs(SUBSET_SLUG, "csv"), "GSEA")
+fig_dir   <- file.path(out_dirs(SUBSET_SLUG, "pdf"), "GSEA")
+
+# family, subfolder, and whether the family can be ranked. The omnibus family is
+# scanned for the manifest only: an unsigned F statistic cannot rank a GSEA list.
+FAMS <- list(
+  c("condition",                          "condition",                          "rank"),
+  c("within_condition_timepoint",         "within_condition_timepoint",         "rank"),
+  c("between_condition_timepoint",        "between_condition_timepoint",        "rank"),
+  c("condition_by_timepoint_interaction", "condition_by_timepoint_interaction", "rank"),
+  c("condition_by_timepoint_interaction_omnibus",
+    file.path("condition_by_timepoint_interaction", "omnibus"),                 "skip"))
+
+deg_dir_of  <- function(fam) file.path(deg_root,  fam[2])
+gsea_dir_of <- function(fam) file.path(gsea_root, fam[2])
+
+for (d in c(vapply(FAMS, gsea_dir_of, character(1)), fig_dir))
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+RANK_COL  <- "stat"   # falls back to avg_log2FC if the column is absent
+MIN_GENES <- 200      # a ranked list shorter than this is not worth testing
+Q_CUT     <- 0.05     # significance cut for the summary plots only
+TOP_N     <- 10
+
+# the DEG csvs carry biotype flags; set TRUE to rank on protein-coding genes only
+GSEA_DROP_FLAGGED <- FALSE
+# mito and ribosomal genes are dropped from the volcanoes in 08, do the same here
+GSEA_DROP_MT_RIBO <- TRUE
+```
+
+```{r, warning=FALSE, results = FALSE, message = FALSE}
+set.seed(2024)
+human_hallmark <- msigdbr(species = "Homo sapiens", collection = "H")
+human_gobp     <- msigdbr(species = "Homo sapiens", collection = "C5", subcollection = "GO:BP")
+human_kegg     <- msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:KEGG_LEGACY")
+human_reactome <- msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:REACTOME")
+human_gene_sets <- rbind(human_hallmark, human_gobp, human_kegg, human_reactome)
+term2gene <- as.data.frame(human_gene_sets[, c("gs_name", "gene_symbol")])
+cat("Gene sets loaded:", dplyr::n_distinct(term2gene$gs_name), "\n")
+```
+
+# Helpers
+
+```{r, warning=FALSE, results = FALSE, message = FALSE}
+# Same parser as the DEG notebook, so a GSEA row and its DEG row carry identical
+# cluster / comparison / timepoint / reference values.
+annot_cols <- function(f, fam) {
+  p <- strsplit(sub(paste0("^", FILE_PREFIX, "__"), "",
+                    sub("\\.csv$", "", basename(f))), "__", fixed = TRUE)[[1]]
+  out <- switch(fam,
+    condition                   = data.frame(comparison = "CASE_vs_CTRL",
+                                             timepoint  = "pooled", reference = NA_character_),
+    within_condition_timepoint  = data.frame(comparison = p[2],
+                                             timepoint  = sub("_vs_.*$", "", p[3]),
+                                             reference  = sub("^.*_vs_", "", p[3])),
+    between_condition_timepoint = data.frame(comparison = "CASE_vs_CTRL",
+                                             timepoint  = sub("^at_", "", p[3]),
+                                             reference  = NA_character_),
+    condition_by_timepoint_interaction =
+                                  data.frame(comparison = "CASE_vs_CTRL",
+                                             timepoint  = sub("_vs_.*$", "", p[3]),
+                                             reference  = sub("^.*_vs_", "", p[3])),
+    condition_by_timepoint_interaction_omnibus =
+                                  data.frame(comparison = "CASE_vs_CTRL",
+                                             timepoint  = "omnibus", reference = NA_character_))
+  cbind(cluster = if (p[1] == "all") "overall" else p[1], out)
+}
+
+contrast_title <- function(a) {
+  paste0(a$cluster, " | ", a$comparison,
+         if (!a$timepoint %in% c("pooled")) paste0(" | ", a$timepoint) else "",
+         if (!is.na(a$reference)) paste0(" vs ", a$reference) else "")
+}
+
+# fgsea indexes the ranked vector by name, so a duplicated symbol silently overwrites its
+# twin and the set membership lookup goes wrong. Duplicates are resolved to the strongest
+# statistic before ranking rather than left to chance.
+build_ranks <- function(df) {
+  rank_col <- if (RANK_COL %in% names(df)) RANK_COL else "avg_log2FC"
+  if (!rank_col %in% names(df)) return(numeric(0))
+  d <- df %>% filter(!is.na(gene), gene != "", is.finite(.data[[rank_col]]))
+  if (GSEA_DROP_FLAGGED && "remove_flag" %in% names(d))
+    d <- d %>% filter(is.na(remove_flag) | !remove_flag)
+  if (GSEA_DROP_MT_RIBO)
+    d <- d %>% filter(!grepl("^MT-", gene), !grepl("^RP[SL]", gene))
+  d <- d %>%
+    arrange(desc(abs(.data[[rank_col]]))) %>%
+    distinct(gene, .keep_all = TRUE)
+  v <- setNames(d[[rank_col]], d$gene)
+  sort(v, decreasing = TRUE)
+}
+
+gsea_human <- function(v) {
+  clusterProfiler::GSEA(
+    geneList = v, TERM2GENE = term2gene,
+    minGSSize = 15, maxGSSize = 500, pvalueCutoff = 1,
+    eps = 0, seed = TRUE, verbose = FALSE)
+}
+
+# xlsx stem for a given DEG csv: identical stem, __GSEA suffix, matching family folder
+out_path_for <- function(f, fam)
+  file.path(gsea_dir_of(fam), sub("\\.csv$", "__GSEA.xlsx", basename(f)))
+```
+
+# Run
+
+Every csv in every family folder is visited. A row is written to the manifest whether the
+list was tested, too short, unrankable, or returned nothing, so the manifest is a complete
+one to one map from DEG csv to GSEA xlsx.
+
+```{r, message=FALSE, warning=FALSE}
+gsea_log <- list()
+
+log_row <- function(fam, f, a, n_ranked, n_sets, n_sig, status, out_f = NA_character_)
+  gsea_log[[length(gsea_log) + 1]] <<- data.frame(
+    family = fam[1], cluster = a$cluster, comparison = a$comparison,
+    timepoint = a$timepoint, reference = a$reference,
+    rank_col = NA_character_, n_ranked = n_ranked, n_sets = n_sets, n_sig = n_sig,
+    status = status, source_csv = basename(f), output_xlsx = out_f,
+    stringsAsFactors = FALSE)
+
+for (fam in FAMS) {
+  in_dir <- deg_dir_of(fam)
+  if (!dir.exists(in_dir)) next
+  # non-recursive: the omnibus subfolder is its own family and is scanned separately
+  csv_files <- sort(list.files(in_dir, pattern = "\\.csv$", full.names = TRUE))
+
+  for (csv_path in csv_files) {
+    a  <- annot_cols(csv_path, fam[1])
+    df <- read.csv(csv_path, stringsAsFactors = FALSE)
+
+    if (fam[3] == "skip") {
+      log_row(fam, csv_path, a, NA_integer_, NA_integer_, NA_integer_, "not rankable")
+      next
+    }
+    if (!("gene" %in% names(df))) {
+      log_row(fam, csv_path, a, NA_integer_, NA_integer_, NA_integer_, "no gene column")
+      next
+    }
+
+    rank_col <- if (RANK_COL %in% names(df)) RANK_COL else "avg_log2FC"
+    v <- build_ranks(df)
+    if (length(v) < MIN_GENES) {
+      r <- log_row(fam, csv_path, a, length(v), NA_integer_, NA_integer_, "skipped")
+      gsea_log[[length(gsea_log)]]$rank_col <- rank_col
+      next
+    }
+
+    gsea_res <- tryCatch(gsea_human(v), error = function(e) NULL)
+    if (is.null(gsea_res) || !nrow(gsea_res@result)) {
+      log_row(fam, csv_path, a, length(v), 0L, 0L, "no result")
+      gsea_log[[length(gsea_log)]]$rank_col <- rank_col
+      next
+    }
+
+    res_df <- cbind(a, family = fam[1], rank_col = rank_col,
+                    source_csv = basename(csv_path), gsea_res@result, row.names = NULL)
+    out_f <- out_path_for(csv_path, fam)
+    write.xlsx(res_df, out_f, rowNames = FALSE)
+
+    log_row(fam, csv_path, a, length(v), nrow(res_df),
+            sum(res_df$qvalue < Q_CUT, na.rm = TRUE), "ok", basename(out_f))
+    gsea_log[[length(gsea_log)]]$rank_col <- rank_col
+  }
+}
+
+gsea_log <- bind_rows(gsea_log)
+gsea_log$timepoint <- factor(gsea_log$timepoint, levels = intersect(
+  c(TP_LEVELS, "pooled", "omnibus"), unique(gsea_log$timepoint)))
+gsea_log <- gsea_log %>% arrange(family, cluster != "overall", cluster, comparison, timepoint)
+
+write.xlsx(gsea_log, file.path(gsea_root, paste0(FILE_PREFIX, "_GSEA_run_manifest.xlsx")),
+           rowNames = FALSE)
+print(as.data.frame(gsea_log %>% filter(cluster == "overall")))
+cat("\nLists tested:", sum(gsea_log$status == "ok"),
+    " skipped:", sum(gsea_log$status != "ok"), "\n")
+```
+
+# Top pathways per comparison
+
+One pdf per family, pages in the same cluster and contrast order as that family's
+workbook sheets.
+
+```{r, results='asis', message=FALSE, warning=FALSE}
+plot_top_pathways <- function(res_df, tag, top_n = TOP_N) {
+  sig <- res_df %>% filter(qvalue < Q_CUT)
+  if (!nrow(sig)) return(NULL)
+  top <- bind_rows(sig %>% arrange(desc(NES)) %>% head(top_n),
+                   sig %>% arrange(NES)       %>% head(top_n)) %>%
+    distinct(ID, .keep_all = TRUE) %>%
+    mutate(dir = ifelse(NES > 0, "up", "down"), ID = str_trunc(ID, 60))
+  ggplot(top, aes(reorder(ID, NES), NES, fill = dir)) +
+    geom_col() + coord_flip() +
+    scale_fill_manual(values = c("up" = "#bb0c00", "down" = "#00AFBB")) +
+    labs(x = NULL, y = "NES", title = tag) +
+    theme_bw() + theme(axis.text.y = element_text(size = 6),
+                       plot.title = element_text(size = 8))
+}
+
+# Reads every xlsx of a family back and stacks it, with the annotation columns already
+# written into each file, so ordering here needs no second parse of the filenames.
+load_family <- function(fam) {
+  fs <- list.files(gsea_dir_of(fam), pattern = "__GSEA\\.xlsx$", full.names = TRUE)
+  if (!length(fs)) return(NULL)
+  d <- bind_rows(lapply(fs, read.xlsx))
+  d$timepoint <- factor(d$timepoint, levels = intersect(
+    c(TP_LEVELS, "pooled", "omnibus"), unique(d$timepoint)))
+  d %>% arrange(cluster != "overall", cluster, comparison, timepoint)
+}
+
+for (fam in FAMS) {
+  if (fam[3] == "skip") next
+  d <- load_family(fam)
+  if (is.null(d)) next
+  pdf(file.path(fig_dir, paste0(FILE_PREFIX, "_GSEA_top_pathways_", fam[1], ".pdf")),
+      width = 9, height = 6)
+  for (cl in unique(d$cluster)) {
+    for (cmp in unique(d$comparison[d$cluster == cl])) {
+      sub_d <- d %>% filter(cluster == cl, comparison == cmp)
+      for (tp in unique(sub_d$timepoint)) {
+        res <- sub_d %>% filter(timepoint == tp)
+        if (!nrow(res)) next
+        ttl <- contrast_title(res[1, c("cluster", "comparison", "timepoint", "reference")])
+        p <- plot_top_pathways(res, paste0(SUBSET_TITLE, ": ", ttl))
+        if (is.null(p)) next
+        cat("##", ttl, "\n")
+        print(p)
+        cat("\n\n")
+      }
+    }
+  }
+  invisible(dev.off())
+}
+```
+
+# Aggregate workbooks
+
+One workbook per family, one sheet per cluster, matching the DEG workbooks. Contrast
+identity lives in the cluster / comparison / timepoint / reference columns and the
+`source_csv` column, not in the sheet name.
+
+```{r, message=FALSE, warning=FALSE}
+for (fam in FAMS) {
+  if (fam[3] == "skip") next
+  d <- load_family(fam)
+  if (is.null(d)) next
+  sheets <- split(d, factor(d$cluster, levels = unique(d$cluster)))
+  names(sheets) <- make.unique(substr(names(sheets), 1, 28), sep = "_")
+  write.xlsx(sheets, file.path(gsea_root,
+    paste0(FILE_PREFIX, "_pseudobulk_GSEA_", fam[1], ".xlsx")), rowNames = FALSE)
+}
+```
+
+```{r}
+# Significance filter
+# |NES| > 1.5 and FDR q < 0.05. Reads the finished GSEA xlsx back rather than the in-memory
+# result, so this chunk is optional and re-runnable and never touches the unfiltered files.
+
+NES_CUT <- 1.5
+Q_SIG   <- 0.05
+
+# tracking columns are pushed behind the clusterProfiler result so the enrichment is the
+# first thing in view
+META_COLS <- c("cluster", "comparison", "timepoint", "reference", "family",
+               "rank_col", "source_csv")
+meta_last <- function(d)
+  d[, c(setdiff(names(d), META_COLS), intersect(META_COLS, names(d))), drop = FALSE]
+
+# read.xlsx returns NULL for a header-only sheet and drops all-NA columns by default,
+# both of which break bind_rows downstream; normalise here once
+read_gsea <- function(f) {
+  x <- tryCatch(read.xlsx(f, skipEmptyCols = FALSE), error = function(e) NULL)
+  if (is.null(x) || !nrow(x)) return(NULL)
+  for (k in c("cluster", "comparison", "timepoint", "reference", "family",
+              "rank_col", "source_csv"))
+    x[[k]] <- if (is.null(x[[k]])) NA_character_ else as.character(x[[k]])
+  x
+}
+
+sig_log <- list()
+
+for (fam in FAMS) {
+  if (fam[3] == "skip") next
+  fs <- list.files(gsea_dir_of(fam), pattern = "__GSEA\\.xlsx$", full.names = TRUE)
+  if (!length(fs)) next
+
+  for (f in fs) {
+    d <- read_gsea(f)
+    out_f <- sub("__GSEA\\.xlsx$", "__GSEA_filtered.xlsx", f)
+
+    # identity comes from the filename, not from the file contents, so it is available
+    # even when the source or the filtered result has no rows
+    a <- annot_cols(sub("__GSEA\\.xlsx$", ".csv", f), fam[1])
+
+    if (is.null(d)) {
+      d_sig <- NULL
+      n_sets <- 0L
+    } else {
+     d_sig  <- d %>% filter(!is.na(NES), !is.na(qvalue), abs(NES) > NES_CUT, qvalue < Q_SIG) %>%
+      arrange(desc(NES)) %>% meta_last()
+      n_sets <- nrow(d)
+      # written even when empty, so every unfiltered file keeps a one to one partner
+      write.xlsx(d_sig, out_f, rowNames = FALSE)
+    }
+    if (is.null(d)) write.xlsx(data.frame(), out_f, rowNames = FALSE)
+
+    sig_log[[length(sig_log) + 1]] <- data.frame(
+      family = fam[1], cluster = a$cluster, comparison = a$comparison,
+      timepoint = a$timepoint, reference = as.character(a$reference),
+      n_sets = n_sets,
+      n_sig  = if (is.null(d_sig)) 0L else nrow(d_sig),
+      n_up   = if (is.null(d_sig)) 0L else sum(d_sig$NES > 0),
+      n_down = if (is.null(d_sig)) 0L else sum(d_sig$NES < 0),
+      source_xlsx = basename(f), output_xlsx = basename(out_f),
+      stringsAsFactors = FALSE)
+  }
+}
+
+# aggregate workbooks, same split and sheet naming as the unfiltered pass
+load_family_sig <- function(fam) {
+  fs <- list.files(gsea_dir_of(fam), pattern = "__GSEA_filtered\\.xlsx$", full.names = TRUE)
+  if (!length(fs)) return(NULL)
+  ds <- lapply(fs, read_gsea)
+  ds <- ds[!vapply(ds, is.null, logical(1))]
+  if (!length(ds)) return(NULL)
+  d <- bind_rows(ds)
+  d$timepoint <- factor(d$timepoint, levels = intersect(
+    c(TP_LEVELS, "pooled", "omnibus"), unique(d$timepoint)))
+   d %>% arrange(cluster != "overall", cluster, comparison, timepoint, desc(NES)) %>% meta_last()
+}
+
+for (fam in FAMS) {
+  if (fam[3] == "skip") next
+  d <- load_family_sig(fam)
+  if (is.null(d)) next
+  sheets <- split(d, factor(d$cluster, levels = unique(d$cluster)))
+  names(sheets) <- make.unique(substr(names(sheets), 1, 28), sep = "_")
+  write.xlsx(sheets, file.path(gsea_root,
+    paste0(FILE_PREFIX, "_pseudobulk_GSEA_", fam[1], "_filtered.xlsx")), rowNames = FALSE)
+}
+
+sig_log <- bind_rows(sig_log)
+write.xlsx(sig_log, file.path(gsea_root,
+  paste0(FILE_PREFIX, "_GSEA_significant_manifest.xlsx")), rowNames = FALSE)
+print(as.data.frame(sig_log %>% filter(cluster == "overall")))
+cat("\nFiles filtered:", nrow(sig_log),
+    " with at least one significant set:", sum(sig_log$n_sig > 0), "\n")
+```
+
