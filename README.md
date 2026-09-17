@@ -134,4 +134,5 @@ Start at [docs/README.md](docs/README.md).
 
 > Ben-Kiki O, Bercovich A, Lifshitz A, Tanay A. Metacell-2: a divide-and-conquer
 > metacell algorithm for scalable scRNA-seq analysis. *Genome Biology* 23, 100 (2022). <br>
-> Claude AI (Anthropic).
+
+> Claude AI (Anthropic, 2026).
